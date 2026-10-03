@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.2
+// Prototype version: 0.0.3
 
 using System;
 using System.Collections.Generic;
@@ -15,9 +15,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         [SerializeField] private SkinnedMeshRenderer _source;
         [SerializeField] private Material _material;
         [SerializeField] private List<Transform> _cutoffBones = new List<Transform>();
-        [SerializeField] private float _cutoffOffset = 0f;
-        [SerializeField] private float _clusterCellSize = 0.03f;
-        [SerializeField] private float _surfaceOffset = 0.005f;
+        [SerializeField] private float _boneCutBias = 0f;
+        [SerializeField] private float _mergeSize = 0f;
+        [SerializeField] private float _surfaceOffset = 0f;
         [SerializeField] private bool _sealOpenBoundaries = true;
         [SerializeField] private float _fadeDistance = 0.05f;
         [SerializeField] private float _fadeStrength = 0.2f;
@@ -33,7 +33,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         {
             var window = GetWindow<orz_Shop_NearShaderProxyVolumeGeneratorWindow>();
             window.titleContent = new GUIContent("Near Shader Proxy Volume");
-            window.minSize = new Vector2(460f, 620f);
+            window.minSize = new Vector2(480f, 660f);
             window.Show();
         }
 
@@ -43,8 +43,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             EditorGUILayout.LabelField("Near Shader Proxy Volume Generator", EditorStyles.boldLabel);
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.2: builds a closed low-poly skinned volume from a body mesh. " +
-                "Optional cutoff bones remove the child-side geometry at each selected joint and the resulting openings are sealed for volume-based proximity rendering.",
+                "Prototype 0.0.3: selected bones are terminal boundaries. " +
+                "The selected bone itself is kept; geometry weighted toward its descendant bones is removed, " +
+                "then open boundaries are sealed for the volume shader.",
                 MessageType.Info);
 
             EditorGUILayout.Space(6f);
@@ -68,6 +69,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         private void DrawSourceSection()
         {
             EditorGUILayout.LabelField("Source", EditorStyles.boldLabel);
+
             _source = (SkinnedMeshRenderer)EditorGUILayout.ObjectField(
                 new GUIContent("Body Mesh", "Source body SkinnedMeshRenderer."),
                 _source,
@@ -77,6 +79,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             using (new EditorGUILayout.HorizontalScope())
             {
                 GUILayout.FlexibleSpace();
+
                 if (GUILayout.Button("Use Selection", GUILayout.Width(120f)))
                 {
                     GameObject selected = Selection.activeGameObject;
@@ -100,10 +103,12 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
         private void DrawCutoffSection()
         {
-            EditorGUILayout.LabelField("Bone Cutoff", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("Bone Boundary", EditorStyles.boldLabel);
+
             EditorGUILayout.HelpBox(
-                "Each cutoff plane passes through the selected bone in bind pose. " +
-                "The parent side is kept and the child/distal side is removed. Multiple bones can be used, e.g. both wrists, ankles, neck, etc.",
+                "A selected bone means \"keep through this bone, remove its descendant-bone side\". " +
+                "Examples: Neck removes Head-side weighting; Wrist removes finger-side weighting; " +
+                "UpperArm removes LowerArm/Hand-side weighting. This is BoneWeight-based, not an infinite spatial plane.",
                 MessageType.None);
 
             if (_cutoffBones == null)
@@ -114,7 +119,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 using (new EditorGUILayout.HorizontalScope())
                 {
                     _cutoffBones[i] = (Transform)EditorGUILayout.ObjectField(
-                        $"Cutoff Bone {i + 1}",
+                        $"Boundary Bone {i + 1}",
                         _cutoffBones[i],
                         typeof(Transform),
                         true);
@@ -126,13 +131,19 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     }
                 }
 
-                if (_source != null && _cutoffBones[i] != null && Array.IndexOf(_source.bones, _cutoffBones[i]) < 0)
-                    EditorGUILayout.HelpBox($"'{_cutoffBones[i].name}' is not a bone used by the selected renderer.", MessageType.Error);
+                if (_source != null &&
+                    _cutoffBones[i] != null &&
+                    Array.IndexOf(_source.bones, _cutoffBones[i]) < 0)
+                {
+                    EditorGUILayout.HelpBox(
+                        $"'{_cutoffBones[i].name}' is not a bone used by the selected renderer.",
+                        MessageType.Error);
+                }
             }
 
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Add Cutoff Bone"))
+                if (GUILayout.Button("Add Boundary Bone"))
                     _cutoffBones.Add(null);
 
                 using (new EditorGUI.DisabledScope(Selection.activeTransform == null))
@@ -152,42 +163,74 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 }
             }
 
-            _cutoffOffset = EditorGUILayout.FloatField(
+            _boneCutBias = EditorGUILayout.Slider(
                 new GUIContent(
-                    "Cutoff Offset",
-                    "Moves every cut plane along parent->bone direction in source mesh local units. Positive keeps slightly more distal geometry."),
-                _cutoffOffset);
+                    "Bone Cut Bias",
+                    "Neutral 0 uses 50% descendant-bone weight as the boundary. " +
+                    "Positive keeps more distal geometry; negative cuts earlier."),
+                _boneCutBias,
+                -0.45f,
+                0.45f);
+
+            if (GUILayout.Button("Reset Bone Cut Bias", GUILayout.Width(170f)))
+                _boneCutBias = 0f;
         }
 
         private void DrawGeometrySection()
         {
             EditorGUILayout.LabelField("Proxy Geometry", EditorStyles.boldLabel);
 
-            _clusterCellSize = EditorGUILayout.FloatField(
+            _mergeSize = EditorGUILayout.Slider(
                 new GUIContent(
-                    "Cluster Cell Size",
-                    "Local-space vertex clustering cell size. Larger values reduce polygons more aggressively but can damage volume closure."),
-                _clusterCellSize);
+                    "Merge Size",
+                    "0 = no intentional low-poly reduction; only epsilon welding is performed. " +
+                    "Increase gradually to merge nearby vertices and reduce polygon count."),
+                _mergeSize,
+                0f,
+                0.05f);
 
-            _surfaceOffset = EditorGUILayout.FloatField(
+            _surfaceOffset = EditorGUILayout.Slider(
                 new GUIContent(
                     "Core Surface Offset",
-                    "Small normal-direction offset applied to the generated core volume. Keep near zero; outer fade is handled by the shader."),
-                _surfaceOffset);
+                    "Normal-direction size adjustment for the generated core volume. " +
+                    "0 preserves the source surface; negative shrinks; positive expands."),
+                _surfaceOffset,
+                -0.05f,
+                0.05f);
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Reset Merge Size"))
+                    _mergeSize = 0f;
+
+                if (GUILayout.Button("Reset Surface Offset"))
+                    _surfaceOffset = 0f;
+            }
 
             _sealOpenBoundaries = EditorGUILayout.Toggle(
                 new GUIContent(
                     "Seal Open Boundaries",
-                    "Find boundary loops after simplification and fill them with cap triangles. Required for stencil-parity inside/outside detection."),
+                    "Fill single-use boundary loops. Required for stencil-parity inside/outside detection."),
                 _sealOpenBoundaries);
 
-            if (_clusterCellSize <= 0f)
-                EditorGUILayout.HelpBox("Cluster Cell Size must be greater than zero.", MessageType.Error);
-            else if (_clusterCellSize > 0.06f)
-                EditorGUILayout.HelpBox("Large clustering cells can collapse thin limbs and create non-manifold geometry. Check Boundary Edges after generation.", MessageType.Warning);
+            EditorGUILayout.HelpBox(
+                "Defaults are intentionally conservative: Merge Size = 0 and Core Surface Offset = 0. " +
+                "First verify correct body coverage, then increase Merge Size only as far as topology remains acceptable.",
+                MessageType.None);
+
+            if (_mergeSize > 0.025f)
+            {
+                EditorGUILayout.HelpBox(
+                    "Merge Size above 0.025 can visibly collapse thin limbs or cut boundaries on many avatars.",
+                    MessageType.Warning);
+            }
 
             if (!_sealOpenBoundaries)
-                EditorGUILayout.HelpBox("The proximity volume shader requires a closed mesh. Disabling sealing is intended only for geometry debugging.", MessageType.Warning);
+            {
+                EditorGUILayout.HelpBox(
+                    "The volume shader expects a closed mesh. Disable sealing only for geometry debugging.",
+                    MessageType.Warning);
+            }
         }
 
         private void DrawShaderSection()
@@ -195,26 +238,32 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             EditorGUILayout.LabelField("Volume Fade Shader", EditorStyles.boldLabel);
 
             _fadeDistance = EditorGUILayout.Slider(
-                new GUIContent("Fade Distance", "World-space normal expansion used for the outer proximity shells."),
+                new GUIContent(
+                    "Fade Distance",
+                    "World-space normal expansion used for the outer proximity shells."),
                 _fadeDistance,
                 0f,
                 0.25f);
 
             _fadeStrength = EditorGUILayout.Slider(
-                new GUIContent("Fade Strength", "Opacity of the outer fade shells before entering the core volume."),
+                new GUIContent(
+                    "Fade Strength",
+                    "Opacity of the outer fade shells before entering the core volume."),
                 _fadeStrength,
                 0f,
                 1f);
 
             _coreStrength = EditorGUILayout.Slider(
-                new GUIContent("Core Black Strength", "Opacity while the camera is inside the original/core proxy volume."),
+                new GUIContent(
+                    "Core Black Strength",
+                    "Opacity while the camera is inside the original/core proxy volume."),
                 _coreStrength,
                 0f,
                 1f);
 
             EditorGUILayout.HelpBox(
-                "Default behavior: outside all shells = no effect; inside outer shell = very light black; " +
-                "inside mid shell = stronger fade; inside the core = black. The shader does not use object-origin distance or vertex *= 3.",
+                "Outside all shells = no effect; outer/mid shells = light black fade; " +
+                "inside the core = full/adjustable blackout.",
                 MessageType.None);
         }
 
@@ -225,28 +274,34 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             _material = (Material)EditorGUILayout.ObjectField(
                 new GUIContent(
                     "Material Override",
-                    "Optional. Leave empty to generate a material using orz_Shop/NearShaderProxyVolume with the Fade/Core values above."),
+                    "Optional. Leave empty to generate a material using orz_Shop/NearShaderProxyVolume."),
                 _material,
                 typeof(Material),
                 false);
 
             _outputFolder = EditorGUILayout.TextField(
-                new GUIContent("Asset Folder", "Generated Mesh/Material asset folder."),
+                new GUIContent(
+                    "Asset Folder",
+                    "Generated Mesh/Material asset folder."),
                 _outputFolder);
 
             _replaceExisting = EditorGUILayout.Toggle(
-                new GUIContent("Replace Existing", "Replace the previously generated proxy volume and mesh asset for this source."),
+                new GUIContent(
+                    "Replace Existing",
+                    "Replace the previously generated proxy volume and mesh asset for this source."),
                 _replaceExisting);
         }
 
         private void DrawActions()
         {
             bool invalidCutoff = HasInvalidCutoffBone();
-            bool canGenerate = _source != null &&
-                               _source.sharedMesh != null &&
-                               _clusterCellSize > 0f &&
-                               _fadeDistance >= 0f &&
-                               !invalidCutoff;
+
+            bool canGenerate =
+                _source != null &&
+                _source.sharedMesh != null &&
+                _mergeSize >= 0f &&
+                _fadeDistance >= 0f &&
+                !invalidCutoff;
 
             using (new EditorGUI.DisabledScope(!canGenerate))
             {
@@ -258,9 +313,15 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             {
                 if (GUILayout.Button("Delete Generated Proxy Volume"))
                 {
-                    bool removed = orz_Shop_NearShaderProxyVolumeGenerator.DeleteGeneratedProxy(_source, _outputFolder);
+                    bool removed =
+                        orz_Shop_NearShaderProxyVolumeGenerator.DeleteGeneratedProxy(
+                            _source,
+                            _outputFolder);
+
                     if (!removed)
+                    {
                         ShowNotification(new GUIContent("No generated proxy volume found."));
+                    }
                     else
                     {
                         _lastResult = null;
@@ -276,11 +337,13 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 return false;
 
             Transform[] bones = _source.bones ?? Array.Empty<Transform>();
+
             foreach (Transform cutoff in _cutoffBones)
             {
                 if (cutoff != null && Array.IndexOf(bones, cutoff) < 0)
                     return true;
             }
+
             return false;
         }
 
@@ -290,66 +353,111 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 return;
 
             EditorGUILayout.LabelField("Last Generation", EditorStyles.boldLabel);
-            EditorGUILayout.LabelField("Vertices", $"{_lastResult.SourceVertexCount:N0} -> {_lastResult.ProxyVertexCount:N0}");
-            EditorGUILayout.LabelField("Triangles", $"{_lastResult.SourceTriangleCount:N0} -> {_lastResult.ProxyTriangleCount:N0}");
-            EditorGUILayout.LabelField("Cut Planes", _lastResult.CutPlaneCount.ToString());
-            EditorGUILayout.LabelField("Boundary Edges Before Seal", _lastResult.BoundaryEdgesBeforeSeal.ToString("N0"));
-            EditorGUILayout.LabelField("Boundary Edges After Seal", _lastResult.BoundaryEdgesAfterSeal.ToString("N0"));
+            EditorGUILayout.LabelField(
+                "Vertices",
+                $"{_lastResult.SourceVertexCount:N0} -> {_lastResult.ProxyVertexCount:N0}");
+            EditorGUILayout.LabelField(
+                "Triangles",
+                $"{_lastResult.SourceTriangleCount:N0} -> {_lastResult.ProxyTriangleCount:N0}");
+            EditorGUILayout.LabelField(
+                "Bone Boundaries",
+                _lastResult.CutPlaneCount.ToString());
 
-            if (_lastResult.BoundaryEdgesAfterSeal == 0)
+            if (_lastResult.SkippedBoundaryCount > 0)
             {
-                EditorGUILayout.HelpBox("Closed-volume edge check passed: no single-use boundary edges remain.", MessageType.Info);
+                EditorGUILayout.HelpBox(
+                    $"{_lastResult.SkippedBoundaryCount} selected boundary bone(s) had no renderer-used descendants and produced no cut.",
+                    MessageType.Warning);
+            }
+
+            EditorGUILayout.LabelField(
+                "Boundary Edges Before Seal",
+                _lastResult.BoundaryEdgesBeforeSeal.ToString("N0"));
+            EditorGUILayout.LabelField(
+                "Boundary Edges After Seal",
+                _lastResult.BoundaryEdgesAfterSeal.ToString("N0"));
+            EditorGUILayout.LabelField(
+                "Non-Manifold Edges After Seal",
+                _lastResult.NonManifoldEdgesAfterSeal.ToString("N0"));
+
+            if (_lastResult.BoundaryEdgesAfterSeal == 0 &&
+                _lastResult.NonManifoldEdgesAfterSeal == 0)
+            {
+                EditorGUILayout.HelpBox(
+                    "Closed-volume edge check passed.",
+                    MessageType.Info);
             }
             else
             {
                 EditorGUILayout.HelpBox(
-                    "Open boundary edges remain. Stencil parity can leak or fail. Reduce Cluster Cell Size or inspect non-manifold/source topology.",
+                    "The generated volume is not cleanly closed/manifold. " +
+                    "Keep Merge Size at 0 first, then inspect source topology or boundary selection.",
                     MessageType.Warning);
             }
 
             if (_lastResult.SourceTriangleCount > 0)
             {
-                float ratio = (float)_lastResult.ProxyTriangleCount / _lastResult.SourceTriangleCount;
-                EditorGUILayout.LabelField("Triangle Ratio", $"{ratio:P1}");
+                float ratio =
+                    (float)_lastResult.ProxyTriangleCount /
+                    _lastResult.SourceTriangleCount;
+
+                EditorGUILayout.LabelField(
+                    "Triangle Ratio",
+                    $"{ratio:P1}");
             }
 
-            EditorGUILayout.ObjectField("Proxy Object", _lastResult.ProxyObject, typeof(GameObject), true);
-            EditorGUILayout.ObjectField("Proxy Mesh", _lastResult.ProxyMesh, typeof(Mesh), false);
-            EditorGUILayout.ObjectField("Material", _lastResult.AssignedMaterial, typeof(Material), false);
+            EditorGUILayout.ObjectField(
+                "Proxy Object",
+                _lastResult.ProxyObject,
+                typeof(GameObject),
+                true);
+            EditorGUILayout.ObjectField(
+                "Proxy Mesh",
+                _lastResult.ProxyMesh,
+                typeof(Mesh),
+                false);
+            EditorGUILayout.ObjectField(
+                "Material",
+                _lastResult.AssignedMaterial,
+                typeof(Material),
+                false);
         }
 
         private void Generate()
         {
             try
             {
-                _lastResult = orz_Shop_NearShaderProxyVolumeGenerator.Generate(
-                    _source,
-                    _material,
-                    _cutoffBones,
-                    _cutoffOffset,
-                    _clusterCellSize,
-                    _surfaceOffset,
-                    _sealOpenBoundaries,
-                    _fadeDistance,
-                    _fadeStrength,
-                    _coreStrength,
-                    _outputFolder,
-                    _replaceExisting);
+                _lastResult =
+                    orz_Shop_NearShaderProxyVolumeGenerator.Generate(
+                        _source,
+                        _material,
+                        _cutoffBones,
+                        _boneCutBias,
+                        _mergeSize,
+                        _surfaceOffset,
+                        _sealOpenBoundaries,
+                        _fadeDistance,
+                        _fadeStrength,
+                        _coreStrength,
+                        _outputFolder,
+                        _replaceExisting);
 
                 Selection.activeGameObject = _lastResult.ProxyObject;
                 EditorGUIUtility.PingObject(_lastResult.ProxyObject);
                 SceneView.RepaintAll();
 
                 Debug.Log(
-                    $"[NearShaderProxyMeshGenerator] Closed proxy volume generated. " +
+                    "[NearShaderProxyMeshGenerator] Closed proxy volume generated. " +
                     $"V {_lastResult.SourceVertexCount} -> {_lastResult.ProxyVertexCount}, " +
                     $"T {_lastResult.SourceTriangleCount} -> {_lastResult.ProxyTriangleCount}, " +
-                    $"Boundary {_lastResult.BoundaryEdgesBeforeSeal} -> {_lastResult.BoundaryEdgesAfterSeal}.",
+                    $"Boundary {_lastResult.BoundaryEdgesBeforeSeal} -> {_lastResult.BoundaryEdgesAfterSeal}, " +
+                    $"NonManifold {_lastResult.NonManifoldEdgesAfterSeal}.",
                     _lastResult.ProxyObject);
             }
             catch (Exception ex)
             {
                 Debug.LogException(ex);
+
                 EditorUtility.DisplayDialog(
                     "Near Shader Proxy Volume Generator",
                     ex.Message,

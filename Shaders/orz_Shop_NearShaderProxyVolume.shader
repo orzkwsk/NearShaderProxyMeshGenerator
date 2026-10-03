@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.2
+// Prototype version: 0.0.3
 // Closed-volume camera proximity effect using stencil parity.
 
 Shader "orz_Shop/NearShaderProxyVolume"
@@ -50,20 +50,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             return o;
         }
 
-        v2f VertOuter(appdata v)
-        {
-            return ExpandVertex(v, _FadeDistance);
-        }
-
-        v2f VertMid(appdata v)
-        {
-            return ExpandVertex(v, _FadeDistance * 0.5);
-        }
-
-        v2f VertCore(appdata v)
-        {
-            return ExpandVertex(v, 0.0);
-        }
+        v2f VertOuter(appdata v) { return ExpandVertex(v, _FadeDistance); }
+        v2f VertMid(appdata v)   { return ExpandVertex(v, _FadeDistance * 0.5); }
+        v2f VertCore(appdata v)  { return ExpandVertex(v, 0.0); }
 
         fixed4 FragOuter(v2f i) : SV_Target
         {
@@ -80,16 +69,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             return fixed4(_Color.rgb, saturate(_CoreStrength));
         }
 
-        fixed4 FragMask(v2f i) : SV_Target
-        {
-            return 0;
-        }
+        fixed4 FragMask(v2f i) : SV_Target { return 0; }
         ENDCG
 
-        // OUTER SHELL ---------------------------------------------------------
-        // Toggle stencil bit 7 once for every surface crossing. A closed mesh
-        // gives an even number of crossings from outside and an odd number
-        // when the camera is inside the shell.
         Pass
         {
             Name "OUTER_PARITY"
@@ -117,7 +99,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
         {
             Name "OUTER_FADE"
             Blend SrcAlpha OneMinusSrcAlpha
-            Cull Front
+            Cull Off
             ZWrite Off
             ZTest Always
 
@@ -136,7 +118,6 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ENDCG
         }
 
-        // MID SHELL -----------------------------------------------------------
         Pass
         {
             Name "MID_PARITY"
@@ -164,7 +145,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
         {
             Name "MID_FADE"
             Blend SrcAlpha OneMinusSrcAlpha
-            Cull Front
+            Cull Off
             ZWrite Off
             ZTest Always
 
@@ -183,7 +164,6 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ENDCG
         }
 
-        // CORE ----------------------------------------------------------------
         Pass
         {
             Name "CORE_PARITY"
@@ -211,7 +191,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
         {
             Name "CORE_BLACK"
             Blend SrcAlpha OneMinusSrcAlpha
-            Cull Front
+            Cull Off
             ZWrite Off
             ZTest Always
 

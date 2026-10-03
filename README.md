@@ -53,6 +53,8 @@ Defaults are intentionally neutral:
 - `Core Surface Offset = 0`
 - `Bone Cut Bias = 0`
 
+The EditorWindow migrates old serialized prototype values to these neutral defaults on first load of 0.0.3.
+
 `Merge Size = 0` means no intentional low-poly reduction. A very small epsilon weld is still performed because triangle clipping creates duplicate per-triangle vertices and the volume requires shared edges.
 
 Increase `Merge Size` gradually only after verifying the generated coverage. Large values can collapse thin limbs or cut boundaries.
@@ -89,6 +91,8 @@ Three nested shells are evaluated:
 3. core = generated proxy surface.
 
 Each shell uses stencil parity to distinguish camera-inside from camera-outside state.
+
+The color passes use `Cull Off` in 0.0.3 so generated cap winding does not suppress the inside effect.
 
 Intended result:
 

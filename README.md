@@ -1,8 +1,8 @@
 # NearShaderProxyMeshGenerator
 
-Unity Editor prototype for generating a low-poly **closed skinned proxy volume** from an existing avatar/body `SkinnedMeshRenderer`.
+Unity Editor prototype for generating a **closed skinned proxy volume** from an avatar/body `SkinnedMeshRenderer` for camera near/proximity blackout effects.
 
-The proxy is backing geometry for camera near/proximity effects. It is not intended to be visible avatar geometry or a general-purpose LOD generator.
+The proxy is not intended as visible avatar geometry or a general-purpose LOD.
 
 ## Branch policy
 
@@ -12,141 +12,122 @@ The proxy is backing geometry for camera near/proximity effects. It is not inten
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## Prototype 0.0.2
+## Prototype 0.0.3
 
-The 0.0.2 path is available from:
+Menu:
 
 `orz_Shop > Near Shader Proxy Volume Generator`
 
-It adds a closed-volume workflow intended for a blackout/proximity shader:
+### Bone boundary semantics
 
-- Select a body `SkinnedMeshRenderer`.
-- Optionally specify one or more **Cutoff Bones**.
-- For each cutoff bone, reconstruct the bone position from the source bindpose.
-- Build a plane through the selected bone, normal to the parent -> bone direction.
-- Keep the parent/proximal side and remove the child/distal side.
-- Clip triangles against each cut plane and interpolate new vertex Normal/UV/BoneWeight values.
-- Reduce the clipped mesh using local-space vertex clustering.
-- Keep source `bones`, `rootBone`, bindposes, and strongest 4 accumulated bone influences.
-- Apply only a small normal-direction `Core Surface Offset` to the core volume.
-- Detect single-use boundary edges after simplification.
-- Optionally seal boundary loops with cap triangles.
-- Report boundary edge counts before and after sealing.
-- Create a default material using `orz_Shop/NearShaderProxyVolume` when no override material is supplied.
+0.0.2 used an infinite spatial cut plane through the selected bone. This could retain the wrong body half-space depending on bone axis/avatar layout.
+
+0.0.3 changes the cutoff to **BoneWeight-based terminal boundaries**:
+
+- selected bone itself is kept;
+- source bones that are descendants of the selected bone are treated as the distal side;
+- each vertex gets a distal-weight value from those descendant bone influences;
+- the default boundary is 50% distal weight;
+- triangles crossing that weight boundary are clipped and new vertex Normal/UV/BoneWeight values are interpolated;
+- multiple selected bones are applied as multiple terminal boundaries.
+
+Examples:
+
+- `Neck`: keep through Neck, remove Head-side weighting;
+- `Wrist`: keep through Wrist, remove finger-side weighting;
+- `UpperArm`: keep through UpperArm, remove LowerArm/Hand-side weighting.
+
+`Bone Cut Bias` is centered at `0`:
+
+- `0`: 50% descendant weight boundary;
+- positive: keep more distal geometry;
+- negative: cut earlier.
+
+A selected terminal bone with no renderer-used descendants cannot define a BoneWeight boundary and is reported as skipped.
+
+### Geometry controls
+
+Defaults are intentionally neutral:
+
+- `Merge Size = 0`
+- `Core Surface Offset = 0`
+- `Bone Cut Bias = 0`
+
+`Merge Size = 0` means no intentional low-poly reduction. A very small epsilon weld is still performed because triangle clipping creates duplicate per-triangle vertices and the volume requires shared edges.
+
+Increase `Merge Size` gradually only after verifying the generated coverage. Large values can collapse thin limbs or cut boundaries.
+
+`Core Surface Offset` is a signed normal-direction adjustment:
+
+- `0`: preserve source surface;
+- negative: shrink;
+- positive: expand.
+
+### Closed-volume diagnostics
+
+After mesh generation the tool reports:
+
+- `Boundary Edges Before Seal`
+- `Boundary Edges After Seal`
+- `Non-Manifold Edges After Seal`
+
+For the stencil-parity shader, the desired state is:
+
+- `Boundary Edges After Seal = 0`
+- `Non-Manifold Edges After Seal = 0`
+
+`Seal Open Boundaries` fills traced boundary loops using simple cap fans. Caps are backing geometry and are not intended for visible rendering.
+
+## Shader concept
+
+`Shaders/orz_Shop_NearShaderProxyVolume.shader` uses the generated mesh itself as the proximity volume. It does not use object-origin distance and does not use the original shader's fixed `vertex *= 3` expansion.
+
+Three nested shells are evaluated:
+
+1. outer shell = core expanded by `Fade Distance`;
+2. mid shell = core expanded by half `Fade Distance`;
+3. core = generated proxy surface.
+
+Each shell uses stencil parity to distinguish camera-inside from camera-outside state.
+
+Intended result:
+
+- outside outer shell: no effect;
+- inside outer shell: light black fade;
+- inside mid shell: stronger fade;
+- inside core: black according to `Core Black Strength`.
+
+The shader currently uses stencil bit `128` and six passes total.
+
+## Recommended validation order
+
+1. Keep `Merge Size = 0` and `Core Surface Offset = 0`.
+2. Select one boundary bone and verify that the intended distal weighted region disappears.
+3. Verify `Boundary Edges After Seal = 0` and `Non-Manifold Edges After Seal = 0`.
+4. Add the remaining boundary bones.
+5. Test proximity fade/blackout.
+6. Only then increase `Merge Size` to reduce polygon count.
+
+## Known limitations
+
+- BoneWeight boundary behavior depends on the avatar's actual skinning quality.
+- Legacy `BoneWeight` handling is reduced to the strongest four influences per generated vertex.
+- BlendShapes are not transferred.
+- Tangents are not generated.
+- UV fidelity is not a goal.
+- Boundary sealing uses simple fan caps.
+- Complex/non-manifold source topology can still defeat sealing/parity.
+- Self-intersections are not resolved.
+- The volume shader reserves stencil bit 128 while evaluating each shell.
 
 Generated assets default to:
 
 `Assets/Generated/NearShaderProxyMesh/`
 
-## Shader concept
-
-`Shaders/orz_Shop_NearShaderProxyVolume.shader` does **not** use object-origin distance and does not multiply all vertices by a fixed scale.
-
-Instead it uses the generated mesh as the actual proximity volume:
-
-1. **Outer shell**: core mesh expanded along world-space vertex normals by `Fade Distance`.
-2. **Mid shell**: expanded by half of `Fade Distance`.
-3. **Core**: the generated proxy surface itself.
-
-Each shell uses stencil parity:
-
-- render all shell faces with `ColorMask 0`, `ZTest Always`, and `Stencil Pass Invert`;
-- a ray from outside a closed mesh crosses an even number of faces, leaving the stencil bit clear;
-- a ray starting inside a closed mesh crosses an odd number of faces, leaving the stencil bit set;
-- a `Cull Front` color pass then draws only where the parity bit is set and clears that bit again.
-
-Resulting intent:
-
-- outside the outer shell: no effect;
-- inside the outer shell: light black fade;
-- inside the mid shell: stronger fade;
-- inside the core proxy: black according to `Core Black Strength`.
-
-The shader currently uses stencil bit `128` internally. Materials/shaders that also write that bit can interfere with the parity test.
-
-## Recommended starting values
-
-- `Cluster Cell Size`: `0.02` - `0.04`
-- `Core Surface Offset`: `0.0` - `0.01`
-- `Fade Distance`: `0.03` - `0.08`
-- `Fade Strength`: `0.1` - `0.3`
-- `Core Black Strength`: `1.0`
-- `Seal Open Boundaries`: On
-
-Unlike 0.0.1, a large `Surface Offset` is no longer the main method for creating the proximity range. The shader's outer shells provide that range.
-
-## Bone cutoff semantics
-
-A cutoff bone means **"keep geometry up to this bone from the parent side"**.
-
-For a cutoff bone `B` with parent `P`:
-
-- cut origin = bind-pose position of `B`;
-- cut normal = normalized `(B - P)`;
-- kept half-space = parent/proximal side of that plane.
-
-`Cutoff Offset` moves the plane along the parent -> bone direction. Positive values retain slightly more distal geometry.
-
-Multiple cutoff bones are applied as multiple half-space clips. Typical uses are paired wrists, ankles, a neck cutoff, or limb cutoffs.
-
-## Closed-volume requirement
-
-Stencil parity depends on a closed surface. The generator reports:
-
-- `Boundary Edges Before Seal`
-- `Boundary Edges After Seal`
-
-`Boundary Edges After Seal = 0` is the desired result.
-
-A non-zero result means open/non-manifold topology remains and the shader can leak, miss pixels, or produce unstable inside/outside results. Reduce `Cluster Cell Size`, change cutoff positions, or inspect the source/proxy topology.
-
-## 0.0.1 baseline
-
-The original menu remains temporarily available for comparison:
-
-`orz_Shop > Near Shader Proxy Mesh Generator`
-
-0.0.1 performs:
-
-- body mesh read;
-- vertex clustering;
-- normal-direction inflate;
-- bone/root/bindpose reuse;
-- material assignment.
-
-It does not provide bone-plane clipping, boundary sealing, or closed-volume shader logic.
-
-## Current validation focus
-
-Before replacing the 0.0.1 path, validate:
-
-- Cutoff planes actually land at the expected joints on multiple avatars.
-- Wrist/ankle/neck cuts produce usable caps.
-- `Boundary Edges After Seal` reaches zero on normal avatar body meshes.
-- Aggressive clustering does not create non-manifold topology that defeats parity.
-- The core surface blacks out reliably when the camera enters it.
-- Outer and mid shells produce a useful pre-entry fade without visible silhouette artifacts while outside.
-- Skinning at elbows/knees/hips remains sufficient for proximity coverage even if visually ugly.
-- Stencil bit 128 does not conflict with the target avatar shader stack.
-
-## Known limitations
-
-- This is not a visual LOD generator. Coverage and closed-volume behavior take priority over appearance.
-- Boundary sealing uses simple fan caps and is not intended for visible rendering.
-- Complex/non-manifold boundary networks may not be sealable by the prototype loop tracer.
-- Self-intersections are not resolved. Parity tolerates some self-intersection, but pathological topology can still fail.
-- BlendShapes are not transferred.
-- Tangents are not generated.
-- UV0 fidelity is not a goal.
-- Bone weights are reduced to the strongest 4 accumulated influences per generated vertex.
-- Cutoff planes are half-space cuts; a badly chosen bone axis can clip unrelated geometry if that geometry lies beyond the same plane.
-- The volume shader currently uses six passes: parity + color for outer, mid, and core shells.
-- The shader relies on the stencil buffer and reserves bit 128 while each shell is evaluated.
-
 ## Current files
 
-- `Editor/orz_Shop_NearShaderProxyMeshGenerator.cs` - 0.0.1 baseline mesh generator.
-- `Editor/orz_Shop_NearShaderProxyMeshGeneratorWindow.cs` - 0.0.1 baseline EditorWindow.
-- `Editor/orz_Shop_NearShaderProxyVolumeGenerator.cs` - 0.0.2 clipping, clustering, sealing, skinning, and asset generation.
-- `Editor/orz_Shop_NearShaderProxyVolumeGeneratorWindow.cs` - 0.0.2 cutoff/volume EditorWindow.
-- `Shaders/orz_Shop_NearShaderProxyVolume.shader` - closed-volume stencil parity blackout/fade shader.
+- `Editor/orz_Shop_NearShaderProxyMeshGenerator.cs` - 0.0.1 baseline generator.
+- `Editor/orz_Shop_NearShaderProxyMeshGeneratorWindow.cs` - 0.0.1 baseline window.
+- `Editor/orz_Shop_NearShaderProxyVolumeGenerator.cs` - 0.0.3 BoneWeight boundary / weld / sealing / skinning / asset generation.
+- `Editor/orz_Shop_NearShaderProxyVolumeGeneratorWindow.cs` - 0.0.3 controls and diagnostics.
+- `Shaders/orz_Shop_NearShaderProxyVolume.shader` - closed-volume stencil-parity blackout/fade shader.

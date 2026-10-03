@@ -11,7 +11,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
+        private const int CurrentUiVersion = 3;
 
+        [SerializeField] private int _uiVersion = 0;
         [SerializeField] private SkinnedMeshRenderer _source;
         [SerializeField] private Material _material;
         [SerializeField] private List<Transform> _cutoffBones = new List<Transform>();
@@ -35,6 +37,17 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             window.titleContent = new GUIContent("Near Shader Proxy Volume");
             window.minSize = new Vector2(480f, 660f);
             window.Show();
+        }
+
+        private void OnEnable()
+        {
+            if (_uiVersion >= CurrentUiVersion)
+                return;
+
+            _boneCutBias = 0f;
+            _mergeSize = 0f;
+            _surfaceOffset = 0f;
+            _uiVersion = CurrentUiVersion;
         }
 
         private void OnGUI()

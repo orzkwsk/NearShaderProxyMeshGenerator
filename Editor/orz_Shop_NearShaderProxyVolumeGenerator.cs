@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.2
+// Prototype version: 0.0.3
 
 using System;
 using System.Collections.Generic;
@@ -27,8 +27,10 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public int ProxyVertexCount;
             public int ProxyTriangleCount;
             public int CutPlaneCount;
+            public int SkippedBoundaryCount;
             public int BoundaryEdgesBeforeSeal;
             public int BoundaryEdgesAfterSeal;
+            public int NonManifoldEdgesAfterSeal;
         }
 
         private struct VertexData
@@ -39,20 +41,26 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public BoneWeight BoneWeight;
         }
 
-        private readonly struct CutPlane
+        private sealed class BoneBoundary
         {
-            public readonly Vector3 Point;
-            public readonly Vector3 Normal;
+            public Transform Bone;
+            public bool[] DistalBoneMask;
 
-            public CutPlane(Vector3 point, Vector3 normal)
+            public float DistalWeight(BoneWeight weight)
             {
-                Point = point;
-                Normal = normal.normalized;
+                float sum = 0f;
+                if (IsDistal(weight.boneIndex0)) sum += weight.weight0;
+                if (IsDistal(weight.boneIndex1)) sum += weight.weight1;
+                if (IsDistal(weight.boneIndex2)) sum += weight.weight2;
+                if (IsDistal(weight.boneIndex3)) sum += weight.weight3;
+                return sum;
             }
 
-            public float Distance(Vector3 p)
+            private bool IsDistal(int boneIndex)
             {
-                return Vector3.Dot(p - Point, Normal);
+                return boneIndex >= 0 &&
+                       boneIndex < DistalBoneMask.Length &&
+                       DistalBoneMask[boneIndex];
             }
         }
 
@@ -80,12 +88,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             private readonly int _y;
             private readonly int _z;
 
-            public GridKey(Vector3 position, Vector3 origin, float cellSize)
+            public GridKey(Vector3 position, float cellSize)
             {
-                Vector3 relative = position - origin;
-                _x = Mathf.FloorToInt(relative.x / cellSize);
-                _y = Mathf.FloorToInt(relative.y / cellSize);
-                _z = Mathf.FloorToInt(relative.z / cellSize);
+                _x = Mathf.RoundToInt(position.x / cellSize);
+                _y = Mathf.RoundToInt(position.y / cellSize);
+                _z = Mathf.RoundToInt(position.z / cellSize);
             }
 
             public bool Equals(GridKey other) => _x == other._x && _y == other._y && _z == other._z;
@@ -145,6 +152,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 if (a > b) Swap(ref a, ref b);
                 if (b > c) Swap(ref b, ref c);
                 if (a > b) Swap(ref a, ref b);
+
                 _a = a;
                 _b = b;
                 _c = c;
@@ -166,8 +174,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             SkinnedMeshRenderer source,
             Material requestedMaterial,
             IReadOnlyList<Transform> cutoffBones,
-            float cutoffOffset,
-            float clusterCellSize,
+            float boneCutBias,
+            float mergeSize,
             float surfaceOffset,
             bool sealOpenBoundaries,
             float fadeDistance,
@@ -180,46 +188,58 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 throw new ArgumentNullException(nameof(source));
             if (source.sharedMesh == null)
                 throw new InvalidOperationException("Source SkinnedMeshRenderer has no sharedMesh.");
-            if (clusterCellSize <= 0f)
-                throw new ArgumentOutOfRangeException(nameof(clusterCellSize), "Cluster Cell Size must be greater than zero.");
+            if (mergeSize < 0f)
+                throw new ArgumentOutOfRangeException(nameof(mergeSize), "Merge Size must not be negative.");
             if (fadeDistance < 0f)
                 throw new ArgumentOutOfRangeException(nameof(fadeDistance), "Fade Distance must not be negative.");
             if (string.IsNullOrWhiteSpace(outputFolder) || !outputFolder.StartsWith("Assets", StringComparison.Ordinal))
                 throw new ArgumentException("Output folder must be inside Assets/.", nameof(outputFolder));
 
             Mesh sourceMesh = source.sharedMesh;
-            ReadSourceMesh(sourceMesh, source.bones,
+            ReadSourceMesh(
+                sourceMesh,
+                source.bones,
                 out Vector3[] sourceVertices,
                 out Vector3[] sourceNormals,
                 out Vector2[] sourceUvs,
                 out BoneWeight[] sourceBoneWeights,
                 out List<int> sourceTriangles);
 
-            List<CutPlane> cutPlanes = BuildCutPlanes(source, sourceMesh, cutoffBones, cutoffOffset);
-            ClipGeometry(
+            List<BoneBoundary> boundaries = BuildBoneBoundaries(source, cutoffBones, out int skippedBoundaryCount);
+            float distalThreshold = Mathf.Clamp(0.5f + boneCutBias, 0.01f, 0.99f);
+
+            ClipGeometryByBoneBoundaries(
                 sourceVertices,
                 sourceNormals,
                 sourceUvs,
                 sourceBoneWeights,
                 sourceTriangles,
-                cutPlanes,
+                boundaries,
+                distalThreshold,
                 out List<VertexData> clippedVertices,
                 out List<int> clippedTriangles);
 
             if (clippedTriangles.Count == 0)
-                throw new InvalidOperationException("All triangles were removed by the selected cutoff bones.");
+                throw new InvalidOperationException(
+                    "All triangles were removed by the selected bone boundaries. " +
+                    "Move Bone Cut Bias toward +, or remove an incorrect boundary bone.");
 
-            Mesh proxyMesh = BuildClusteredProxy(
+            Mesh proxyMesh = BuildProxy(
                 sourceMesh,
                 clippedVertices,
                 clippedTriangles,
-                clusterCellSize,
+                mergeSize,
                 surfaceOffset);
 
-            int boundaryBeforeSeal = CountBoundaryEdges(proxyMesh.triangles);
+            Dictionary<EdgeKey, EdgeInfo> beforeEdges = BuildEdgeTable(proxyMesh.triangles);
+            int boundaryBeforeSeal = beforeEdges.Count(pair => pair.Value.Count == 1);
+
             if (sealOpenBoundaries && boundaryBeforeSeal > 0)
                 SealOpenBoundaries(proxyMesh);
-            int boundaryAfterSeal = CountBoundaryEdges(proxyMesh.triangles);
+
+            Dictionary<EdgeKey, EdgeInfo> afterEdges = BuildEdgeTable(proxyMesh.triangles);
+            int boundaryAfterSeal = afterEdges.Count(pair => pair.Value.Count == 1);
+            int nonManifoldAfterSeal = afterEdges.Count(pair => pair.Value.Count > 2);
 
             EnsureAssetFolder(outputFolder);
             string safeName = MakeSafeFileName(source.gameObject.name + ProxySuffix);
@@ -228,6 +248,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             if (replaceExisting && AssetDatabase.LoadAssetAtPath<Mesh>(meshPath) != null)
                 AssetDatabase.DeleteAsset(meshPath);
+
             if (!replaceExisting)
                 meshPath = AssetDatabase.GenerateUniqueAssetPath(meshPath);
 
@@ -235,7 +256,12 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             Material material = requestedMaterial;
             if (material == null)
-                material = GetOrCreateVolumeMaterial(materialPath, replaceExisting, fadeDistance, fadeStrength, coreStrength);
+                material = GetOrCreateVolumeMaterial(
+                    materialPath,
+                    replaceExisting,
+                    fadeDistance,
+                    fadeStrength,
+                    coreStrength);
 
             Transform existing = source.transform.Find(source.gameObject.name + ProxySuffix);
             if (existing != null && replaceExisting)
@@ -259,8 +285,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             proxyRenderer.receiveShadows = false;
             proxyRenderer.lightProbeUsage = LightProbeUsage.Off;
             proxyRenderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
-            proxyRenderer.localBounds = ExpandBounds(source.localBounds,
-                Mathf.Abs(surfaceOffset) + Mathf.Max(fadeDistance, clusterCellSize));
+            proxyRenderer.localBounds = ExpandBounds(
+                source.localBounds,
+                Mathf.Abs(surfaceOffset) + Mathf.Max(fadeDistance, mergeSize));
 
             EditorUtility.SetDirty(proxyObject);
             AssetDatabase.SaveAssets();
@@ -274,9 +301,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 SourceTriangleCount = sourceTriangles.Count / 3,
                 ProxyVertexCount = proxyMesh.vertexCount,
                 ProxyTriangleCount = proxyMesh.triangles.Length / 3,
-                CutPlaneCount = cutPlanes.Count,
+                CutPlaneCount = boundaries.Count,
+                SkippedBoundaryCount = skippedBoundaryCount,
                 BoundaryEdgesBeforeSeal = boundaryBeforeSeal,
-                BoundaryEdgesAfterSeal = boundaryAfterSeal
+                BoundaryEdgesAfterSeal = boundaryAfterSeal,
+                NonManifoldEdgesAfterSeal = nonManifoldAfterSeal
             };
         }
 
@@ -293,7 +322,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 changed = true;
             }
 
-            if (!string.IsNullOrWhiteSpace(outputFolder) && outputFolder.StartsWith("Assets", StringComparison.Ordinal))
+            if (!string.IsNullOrWhiteSpace(outputFolder) &&
+                outputFolder.StartsWith("Assets", StringComparison.Ordinal))
             {
                 string safeName = MakeSafeFileName(source.gameObject.name + ProxySuffix);
                 string meshPath = $"{outputFolder}/{safeName}.asset";
@@ -306,72 +336,73 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             if (changed)
                 AssetDatabase.SaveAssets();
+
             return changed;
         }
 
-        private static List<CutPlane> BuildCutPlanes(
+        private static List<BoneBoundary> BuildBoneBoundaries(
             SkinnedMeshRenderer source,
-            Mesh sourceMesh,
             IReadOnlyList<Transform> cutoffBones,
-            float cutoffOffset)
+            out int skippedBoundaryCount)
         {
-            var result = new List<CutPlane>();
+            skippedBoundaryCount = 0;
+            var result = new List<BoneBoundary>();
+
             if (cutoffBones == null || cutoffBones.Count == 0)
                 return result;
 
             Transform[] bones = source.bones ?? Array.Empty<Transform>();
-            Matrix4x4[] bindposes = sourceMesh.bindposes;
             var seen = new HashSet<Transform>();
 
-            foreach (Transform bone in cutoffBones)
+            foreach (Transform boundaryBone in cutoffBones)
             {
-                if (bone == null || !seen.Add(bone))
+                if (boundaryBone == null || !seen.Add(boundaryBone))
                     continue;
 
-                int boneIndex = Array.IndexOf(bones, bone);
-                if (boneIndex < 0)
-                    throw new InvalidOperationException($"Cutoff bone '{bone.name}' is not used by the source SkinnedMeshRenderer.");
-                if (bone.parent == null)
-                    throw new InvalidOperationException($"Cutoff bone '{bone.name}' has no parent bone to define a cut direction.");
+                if (Array.IndexOf(bones, boundaryBone) < 0)
+                    throw new InvalidOperationException(
+                        $"Boundary bone '{boundaryBone.name}' is not used by the source SkinnedMeshRenderer.");
 
-                Vector3 bonePosition = GetBindPoseBonePosition(source, bindposes, bones, boneIndex);
-                int parentIndex = Array.IndexOf(bones, bone.parent);
-                Vector3 parentPosition;
-                if (parentIndex >= 0)
-                    parentPosition = GetBindPoseBonePosition(source, bindposes, bones, parentIndex);
-                else
-                    parentPosition = source.transform.worldToLocalMatrix.MultiplyPoint3x4(bone.parent.position);
+                var mask = new bool[bones.Length];
+                int descendantCount = 0;
 
-                Vector3 axis = bonePosition - parentPosition;
-                if (axis.sqrMagnitude < 1e-10f)
-                    throw new InvalidOperationException($"Cutoff bone '{bone.name}' has no usable parent-to-bone direction.");
+                for (int boneIndex = 0; boneIndex < bones.Length; boneIndex++)
+                {
+                    Transform candidate = bones[boneIndex];
+                    if (candidate == null || candidate == boundaryBone)
+                        continue;
 
-                Vector3 normal = axis.normalized;
-                result.Add(new CutPlane(bonePosition + normal * cutoffOffset, normal));
+                    if (candidate.IsChildOf(boundaryBone))
+                    {
+                        mask[boneIndex] = true;
+                        descendantCount++;
+                    }
+                }
+
+                if (descendantCount == 0)
+                {
+                    skippedBoundaryCount++;
+                    continue;
+                }
+
+                result.Add(new BoneBoundary
+                {
+                    Bone = boundaryBone,
+                    DistalBoneMask = mask
+                });
             }
 
             return result;
         }
 
-        private static Vector3 GetBindPoseBonePosition(
-            SkinnedMeshRenderer source,
-            IReadOnlyList<Matrix4x4> bindposes,
-            IReadOnlyList<Transform> bones,
-            int boneIndex)
-        {
-            if (bindposes != null && boneIndex >= 0 && boneIndex < bindposes.Count)
-                return bindposes[boneIndex].inverse.MultiplyPoint3x4(Vector3.zero);
-
-            return source.transform.worldToLocalMatrix.MultiplyPoint3x4(bones[boneIndex].position);
-        }
-
-        private static void ClipGeometry(
+        private static void ClipGeometryByBoneBoundaries(
             IReadOnlyList<Vector3> sourceVertices,
             IReadOnlyList<Vector3> sourceNormals,
             IReadOnlyList<Vector2> sourceUvs,
             IReadOnlyList<BoneWeight> sourceBoneWeights,
             IReadOnlyList<int> sourceTriangles,
-            IReadOnlyList<CutPlane> cutPlanes,
+            IReadOnlyList<BoneBoundary> boundaries,
+            float distalThreshold,
             out List<VertexData> vertices,
             out List<int> triangles)
         {
@@ -387,14 +418,22 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     MakeVertex(sourceTriangles[triangleIndex + 2], sourceVertices, sourceNormals, sourceUvs, sourceBoneWeights)
                 };
 
-                for (int planeIndex = 0; planeIndex < cutPlanes.Count && polygon.Count >= 3; planeIndex++)
-                    polygon = ClipPolygon(polygon, cutPlanes[planeIndex]);
+                for (int boundaryIndex = 0;
+                     boundaryIndex < boundaries.Count && polygon.Count >= 3;
+                     boundaryIndex++)
+                {
+                    polygon = ClipPolygonByBoundary(
+                        polygon,
+                        boundaries[boundaryIndex],
+                        distalThreshold);
+                }
 
                 if (polygon.Count < 3)
                     continue;
 
                 int baseIndex = vertices.Count;
                 vertices.AddRange(polygon);
+
                 for (int i = 1; i + 1 < polygon.Count; i++)
                 {
                     triangles.Add(baseIndex);
@@ -420,26 +459,32 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             };
         }
 
-        private static List<VertexData> ClipPolygon(IReadOnlyList<VertexData> input, CutPlane plane)
+        private static List<VertexData> ClipPolygonByBoundary(
+            IReadOnlyList<VertexData> input,
+            BoneBoundary boundary,
+            float distalThreshold)
         {
             var output = new List<VertexData>(input.Count + 1);
             if (input.Count == 0)
                 return output;
 
             VertexData previous = input[input.Count - 1];
-            float previousDistance = plane.Distance(previous.Position);
+            float previousDistance = boundary.DistalWeight(previous.BoneWeight) - distalThreshold;
             bool previousInside = previousDistance <= 1e-6f;
 
             for (int i = 0; i < input.Count; i++)
             {
                 VertexData current = input[i];
-                float currentDistance = plane.Distance(current.Position);
+                float currentDistance = boundary.DistalWeight(current.BoneWeight) - distalThreshold;
                 bool currentInside = currentDistance <= 1e-6f;
 
                 if (previousInside != currentInside)
                 {
                     float denominator = previousDistance - currentDistance;
-                    float t = Mathf.Abs(denominator) > 1e-8f ? previousDistance / denominator : 0.5f;
+                    float t = Mathf.Abs(denominator) > 1e-8f
+                        ? previousDistance / denominator
+                        : 0.5f;
+
                     output.Add(Interpolate(previous, current, Mathf.Clamp01(t)));
                 }
 
@@ -457,10 +502,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         private static VertexData Interpolate(VertexData a, VertexData b, float t)
         {
             Vector3 normal = Vector3.Lerp(a.Normal, b.Normal, t);
-            if (normal.sqrMagnitude > 1e-12f)
-                normal.Normalize();
-            else
-                normal = Vector3.up;
+            normal = normal.sqrMagnitude > 1e-12f ? normal.normalized : Vector3.up;
 
             return new VertexData
             {
@@ -471,21 +513,23 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             };
         }
 
-        private static Mesh BuildClusteredProxy(
+        private static Mesh BuildProxy(
             Mesh sourceMesh,
             IReadOnlyList<VertexData> sourceVertices,
             IReadOnlyList<int> sourceTriangles,
-            float cellSize,
+            float mergeSize,
             float surfaceOffset)
         {
-            Vector3 origin = CalculateMin(sourceVertices);
+            float epsilonWeld = Mathf.Max(1e-7f, sourceMesh.bounds.size.magnitude * 1e-7f);
+            float cellSize = mergeSize > 1e-7f ? mergeSize : epsilonWeld;
+
             var lookup = new Dictionary<GridKey, int>();
             var clusters = new List<Cluster>();
             var remap = new int[sourceVertices.Count];
 
             for (int i = 0; i < sourceVertices.Count; i++)
             {
-                GridKey key = new GridKey(sourceVertices[i].Position, origin, cellSize);
+                GridKey key = new GridKey(sourceVertices[i].Position, cellSize);
                 if (!lookup.TryGetValue(key, out int clusterIndex))
                 {
                     clusterIndex = clusters.Count;
@@ -504,21 +548,26 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             foreach (Cluster cluster in clusters)
             {
-                float inv = 1f / Mathf.Max(1, cluster.Count);
-                Vector3 normal = cluster.NormalSum.sqrMagnitude > 1e-12f ? cluster.NormalSum.normalized : Vector3.up;
-                vertices.Add(cluster.PositionSum * inv + normal * surfaceOffset);
+                float invCount = 1f / Mathf.Max(1, cluster.Count);
+                Vector3 normal = cluster.NormalSum.sqrMagnitude > 1e-12f
+                    ? cluster.NormalSum.normalized
+                    : Vector3.up;
+
+                vertices.Add(cluster.PositionSum * invCount + normal * surfaceOffset);
                 normals.Add(normal);
-                uvs.Add(cluster.UvSum * inv);
+                uvs.Add(cluster.UvSum * invCount);
                 weights.Add(BuildBoneWeight(cluster.BoneWeights));
             }
 
             var triangles = new List<int>(sourceTriangles.Count);
             var seen = new HashSet<TriangleKey>();
+
             for (int i = 0; i + 2 < sourceTriangles.Count; i += 3)
             {
                 int a = remap[sourceTriangles[i]];
                 int b = remap[sourceTriangles[i + 1]];
                 int c = remap[sourceTriangles[i + 2]];
+
                 if (a == b || b == c || c == a)
                     continue;
 
@@ -535,13 +584,15 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             }
 
             if (triangles.Count == 0)
-                throw new InvalidOperationException("Proxy generation produced no triangles. Reduce Cluster Cell Size or remove cutoff bones.");
+                throw new InvalidOperationException(
+                    "Proxy generation produced no triangles. Set Merge Size to 0 or remove an incorrect boundary bone.");
 
             var mesh = new Mesh
             {
                 name = sourceMesh.name + ProxySuffix,
                 indexFormat = vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16
             };
+
             mesh.SetVertices(vertices);
             mesh.SetNormals(normals);
             mesh.SetUVs(0, uvs);
@@ -549,28 +600,28 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             mesh.bindposes = sourceMesh.bindposes;
             mesh.SetTriangles(triangles, 0, true);
             mesh.RecalculateBounds();
-            return mesh;
-        }
 
-        private static int CountBoundaryEdges(IReadOnlyList<int> triangles)
-        {
-            Dictionary<EdgeKey, EdgeInfo> edges = BuildEdgeTable(triangles);
-            return edges.Count(pair => pair.Value.Count == 1);
+            return mesh;
         }
 
         private static Dictionary<EdgeKey, EdgeInfo> BuildEdgeTable(IReadOnlyList<int> triangles)
         {
             var edges = new Dictionary<EdgeKey, EdgeInfo>();
+
             for (int i = 0; i + 2 < triangles.Count; i += 3)
             {
                 AddEdge(edges, triangles[i], triangles[i + 1]);
                 AddEdge(edges, triangles[i + 1], triangles[i + 2]);
                 AddEdge(edges, triangles[i + 2], triangles[i]);
             }
+
             return edges;
         }
 
-        private static void AddEdge(Dictionary<EdgeKey, EdgeInfo> edges, int from, int to)
+        private static void AddEdge(
+            Dictionary<EdgeKey, EdgeInfo> edges,
+            int from,
+            int to)
         {
             EdgeKey key = new EdgeKey(from, to);
             if (edges.TryGetValue(key, out EdgeInfo info))
@@ -579,7 +630,12 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             }
             else
             {
-                edges.Add(key, new EdgeInfo { Count = 1, From = from, To = to });
+                edges.Add(key, new EdgeInfo
+                {
+                    Count = 1,
+                    From = from,
+                    To = to
+                });
             }
         }
 
@@ -594,7 +650,10 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             var triangles = mesh.triangles.ToList();
 
             Dictionary<EdgeKey, EdgeInfo> edgeTable = BuildEdgeTable(triangles);
-            List<EdgeInfo> boundary = edgeTable.Values.Where(edge => edge.Count == 1).ToList();
+            List<EdgeInfo> boundary = edgeTable.Values
+                .Where(edge => edge.Count == 1)
+                .ToList();
+
             if (boundary.Count == 0)
                 return;
 
@@ -606,6 +665,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             }
 
             var used = new HashSet<EdgeKey>();
+
             foreach (EdgeInfo first in boundary)
             {
                 EdgeKey firstKey = new EdgeKey(first.From, first.To);
@@ -614,6 +674,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
                 var loop = new List<int> { first.From, first.To };
                 used.Add(firstKey);
+
                 int start = first.From;
                 int previous = first.From;
                 int current = first.To;
@@ -626,13 +687,17 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
                     EdgeInfo nextEdge = null;
                     int nextVertex = -1;
+
                     foreach (EdgeInfo candidate in connected)
                     {
                         EdgeKey candidateKey = new EdgeKey(candidate.From, candidate.To);
                         if (used.Contains(candidateKey))
                             continue;
 
-                        int candidateNext = candidate.From == current ? candidate.To : candidate.From;
+                        int candidateNext = candidate.From == current
+                            ? candidate.To
+                            : candidate.From;
+
                         if (candidateNext == previous && connected.Count > 1)
                             continue;
 
@@ -645,6 +710,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         break;
 
                     used.Add(new EdgeKey(nextEdge.From, nextEdge.To));
+
                     if (nextVertex == start)
                     {
                         closed = true;
@@ -662,12 +728,17 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 Vector3 center = Vector3.zero;
                 Vector2 uvCenter = Vector2.zero;
                 var accumulatedWeights = new Dictionary<int, float>();
+
                 foreach (int index in loop)
                 {
                     center += vertices[index];
                     uvCenter += uvs[index];
-                    AccumulateBoneWeight(accumulatedWeights, weights[index], 1f / loop.Count);
+                    AccumulateBoneWeight(
+                        accumulatedWeights,
+                        weights[index],
+                        1f / loop.Count);
                 }
+
                 center /= loop.Count;
                 uvCenter /= loop.Count;
 
@@ -678,7 +749,10 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     Vector3 b = vertices[loop[(i + 1) % loop.Count]] - center;
                     loopNormal += Vector3.Cross(a, b);
                 }
-                Vector3 capNormal = loopNormal.sqrMagnitude > 1e-12f ? -loopNormal.normalized : Vector3.up;
+
+                Vector3 capNormal = loopNormal.sqrMagnitude > 1e-12f
+                    ? -loopNormal.normalized
+                    : Vector3.up;
 
                 int centerIndex = vertices.Count;
                 vertices.Add(center);
@@ -690,13 +764,16 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 {
                     int currentIndex = loop[i];
                     int nextIndex = loop[(i + 1) % loop.Count];
+
                     triangles.Add(nextIndex);
                     triangles.Add(currentIndex);
                     triangles.Add(centerIndex);
                 }
             }
 
-            mesh.indexFormat = vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16;
+            mesh.indexFormat = vertices.Count > 65535
+                ? IndexFormat.UInt32
+                : IndexFormat.UInt16;
             mesh.SetVertices(vertices);
             mesh.SetNormals(normals);
             mesh.SetUVs(0, uvs);
@@ -705,17 +782,24 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             mesh.RecalculateBounds();
         }
 
-        private static void AddAdjacency(Dictionary<int, List<EdgeInfo>> adjacency, int vertex, EdgeInfo edge)
+        private static void AddAdjacency(
+            Dictionary<int, List<EdgeInfo>> adjacency,
+            int vertex,
+            EdgeInfo edge)
         {
             if (!adjacency.TryGetValue(vertex, out List<EdgeInfo> list))
             {
                 list = new List<EdgeInfo>();
                 adjacency.Add(vertex, list);
             }
+
             list.Add(edge);
         }
 
-        private static BoneWeight LerpBoneWeight(BoneWeight a, BoneWeight b, float t)
+        private static BoneWeight LerpBoneWeight(
+            BoneWeight a,
+            BoneWeight b,
+            float t)
         {
             var accumulated = new Dictionary<int, float>();
             AccumulateBoneWeight(accumulated, a, 1f - t);
@@ -723,7 +807,10 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             return BuildBoneWeight(accumulated);
         }
 
-        private static void AccumulateBoneWeight(Dictionary<int, float> target, BoneWeight weight, float multiplier)
+        private static void AccumulateBoneWeight(
+            Dictionary<int, float> target,
+            BoneWeight weight,
+            float multiplier)
         {
             AddInfluence(target, weight.boneIndex0, weight.weight0 * multiplier);
             AddInfluence(target, weight.boneIndex1, weight.weight1 * multiplier);
@@ -731,17 +818,22 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             AddInfluence(target, weight.boneIndex3, weight.weight3 * multiplier);
         }
 
-        private static void AddInfluence(Dictionary<int, float> target, int boneIndex, float weight)
+        private static void AddInfluence(
+            Dictionary<int, float> target,
+            int boneIndex,
+            float weight)
         {
             if (weight <= 0f)
                 return;
+
             if (target.TryGetValue(boneIndex, out float current))
                 target[boneIndex] = current + weight;
             else
                 target.Add(boneIndex, weight);
         }
 
-        private static BoneWeight BuildBoneWeight(Dictionary<int, float> accumulated)
+        private static BoneWeight BuildBoneWeight(
+            Dictionary<int, float> accumulated)
         {
             if (accumulated == null || accumulated.Count == 0)
                 return new BoneWeight { boneIndex0 = 0, weight0 = 1f };
@@ -757,28 +849,33 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 return new BoneWeight { boneIndex0 = 0, weight0 = 1f };
 
             BoneWeight result = default;
+
             for (int i = 0; i < top.Length; i++)
             {
                 float normalized = top[i].Value / total;
+
                 switch (i)
                 {
-                    case 0: result.boneIndex0 = top[i].Key; result.weight0 = normalized; break;
-                    case 1: result.boneIndex1 = top[i].Key; result.weight1 = normalized; break;
-                    case 2: result.boneIndex2 = top[i].Key; result.weight2 = normalized; break;
-                    case 3: result.boneIndex3 = top[i].Key; result.weight3 = normalized; break;
+                    case 0:
+                        result.boneIndex0 = top[i].Key;
+                        result.weight0 = normalized;
+                        break;
+                    case 1:
+                        result.boneIndex1 = top[i].Key;
+                        result.weight1 = normalized;
+                        break;
+                    case 2:
+                        result.boneIndex2 = top[i].Key;
+                        result.weight2 = normalized;
+                        break;
+                    case 3:
+                        result.boneIndex3 = top[i].Key;
+                        result.weight3 = normalized;
+                        break;
                 }
             }
-            return result;
-        }
 
-        private static Vector3 CalculateMin(IReadOnlyList<VertexData> vertices)
-        {
-            if (vertices.Count == 0)
-                return Vector3.zero;
-            Vector3 min = vertices[0].Position;
-            for (int i = 1; i < vertices.Count; i++)
-                min = Vector3.Min(min, vertices[i].Position);
-            return min;
+            return result;
         }
 
         private static void ReadSourceMesh(
@@ -834,13 +931,16 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 normals = CalculateNormals(vertices, triangles);
 
             var weights = new List<BoneWeight>(vertices.Length);
+
             try
             {
                 mesh.GetBoneWeights(weights);
             }
             catch (Exception ex)
             {
-                throw new InvalidOperationException("Failed to read source bone weights. Try enabling Read/Write on the source model importer.", ex);
+                throw new InvalidOperationException(
+                    "Failed to read source bone weights. Try enabling Read/Write on the source model importer.",
+                    ex);
             }
 
             if (weights.Count == vertices.Length)
@@ -850,6 +950,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             else
             {
                 boneWeights = new BoneWeight[vertices.Length];
+
                 for (int i = 0; i < boneWeights.Length; i++)
                 {
                     boneWeights[i] = new BoneWeight
@@ -864,14 +965,17 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         private static List<int> ReadTriangleIndices(Mesh.MeshData data)
         {
             var result = new List<int>();
+
             if (data.indexFormat == IndexFormat.UInt16)
             {
                 NativeArray<ushort> indices = data.GetIndexData<ushort>();
+
                 for (int subMeshIndex = 0; subMeshIndex < data.subMeshCount; subMeshIndex++)
                 {
                     SubMeshDescriptor subMesh = data.GetSubMesh(subMeshIndex);
                     if (subMesh.topology != MeshTopology.Triangles)
                         continue;
+
                     for (int i = 0; i < subMesh.indexCount; i++)
                         result.Add(indices[subMesh.indexStart + i] + subMesh.baseVertex);
                 }
@@ -879,11 +983,13 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             else
             {
                 NativeArray<uint> indices = data.GetIndexData<uint>();
+
                 for (int subMeshIndex = 0; subMeshIndex < data.subMeshCount; subMeshIndex++)
                 {
                     SubMeshDescriptor subMesh = data.GetSubMesh(subMeshIndex);
                     if (subMesh.topology != MeshTopology.Triangles)
                         continue;
+
                     for (int i = 0; i < subMesh.indexCount; i++)
                         result.Add((int)indices[subMesh.indexStart + i] + subMesh.baseVertex);
                 }
@@ -891,24 +997,38 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             if (result.Count == 0)
                 throw new InvalidOperationException("Source mesh has no triangle submeshes.");
+
             return result;
         }
 
-        private static Vector3[] CalculateNormals(IReadOnlyList<Vector3> vertices, IReadOnlyList<int> triangles)
+        private static Vector3[] CalculateNormals(
+            IReadOnlyList<Vector3> vertices,
+            IReadOnlyList<int> triangles)
         {
             var result = new Vector3[vertices.Count];
+
             for (int i = 0; i + 2 < triangles.Count; i += 3)
             {
                 int a = triangles[i];
                 int b = triangles[i + 1];
                 int c = triangles[i + 2];
-                Vector3 normal = Vector3.Cross(vertices[b] - vertices[a], vertices[c] - vertices[a]);
+
+                Vector3 normal = Vector3.Cross(
+                    vertices[b] - vertices[a],
+                    vertices[c] - vertices[a]);
+
                 result[a] += normal;
                 result[b] += normal;
                 result[c] += normal;
             }
+
             for (int i = 0; i < result.Length; i++)
-                result[i] = result[i].sqrMagnitude > 1e-12f ? result[i].normalized : Vector3.up;
+            {
+                result[i] = result[i].sqrMagnitude > 1e-12f
+                    ? result[i].normalized
+                    : Vector3.up;
+            }
+
             return result;
         }
 
@@ -922,6 +1042,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             Material existing = AssetDatabase.LoadAssetAtPath<Material>(path);
             if (existing != null && !replaceExisting)
                 return existing;
+
             if (existing != null)
                 AssetDatabase.DeleteAsset(path);
 
@@ -929,18 +1050,25 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             if (shader == null)
                 shader = Shader.Find("Unlit/Color");
             if (shader == null)
-                throw new InvalidOperationException("NearShaderProxyVolume shader was not found and no fallback shader is available.");
+                throw new InvalidOperationException(
+                    "NearShaderProxyVolume shader was not found and no fallback shader is available.");
 
             var material = new Material(shader)
             {
                 name = Path.GetFileNameWithoutExtension(path)
             };
 
-            if (material.HasProperty("_Color")) material.SetColor("_Color", Color.black);
-            if (material.HasProperty("_FadeDistance")) material.SetFloat("_FadeDistance", fadeDistance);
-            if (material.HasProperty("_FadeStrength")) material.SetFloat("_FadeStrength", fadeStrength);
-            if (material.HasProperty("_CoreStrength")) material.SetFloat("_CoreStrength", coreStrength);
-            if (shader.name == "Unlit/Color") material.color = Color.black;
+            if (material.HasProperty("_Color"))
+                material.SetColor("_Color", Color.black);
+            if (material.HasProperty("_FadeDistance"))
+                material.SetFloat("_FadeDistance", fadeDistance);
+            if (material.HasProperty("_FadeStrength"))
+                material.SetFloat("_FadeStrength", fadeStrength);
+            if (material.HasProperty("_CoreStrength"))
+                material.SetFloat("_CoreStrength", coreStrength);
+
+            if (shader.name == "Unlit/Color")
+                material.color = Color.black;
 
             AssetDatabase.CreateAsset(material, path);
             return material;
@@ -955,6 +1083,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         private static void EnsureAssetFolder(string folder)
         {
             folder = folder.Replace('\\', '/').TrimEnd('/');
+
             if (AssetDatabase.IsValidFolder(folder))
                 return;
 
@@ -963,11 +1092,14 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 throw new ArgumentException("Output folder must be under Assets/.", nameof(folder));
 
             string current = "Assets";
+
             for (int i = 1; i < parts.Length; i++)
             {
                 string next = current + "/" + parts[i];
+
                 if (!AssetDatabase.IsValidFolder(next))
                     AssetDatabase.CreateFolder(current, parts[i]);
+
                 current = next;
             }
         }
@@ -976,6 +1108,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         {
             foreach (char invalid in Path.GetInvalidFileNameChars())
                 name = name.Replace(invalid, '_');
+
             return name;
         }
     }

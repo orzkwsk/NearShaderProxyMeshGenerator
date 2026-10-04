@@ -12,7 +12,7 @@ The proxy is backing geometry for a camera near/proximity shader. It is not a vi
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## 0.0.10 continuous surface-distance fade
+## 0.0.11 eight-shell fade + inset core
 
 Open:
 
@@ -75,7 +75,9 @@ Generated vertices keep interpolated skinning. Output skinning is normalized to 
 - Core Surface Offset: `0`
 - Seal Open Boundaries: On
 - Fade Distance: `0.05`
+- Core Inset: `0.01`
 - Fade To Core: `1.0`
+- Shell Dither: `0.15`
 - Core Black Strength: `1.0`
 
 `Mesh Quality = 100%` disables intentional polygon reduction. A very small positional weld is still used to reconnect duplicated triangle vertices / source seams.
@@ -169,35 +171,70 @@ When **Select All** is active, the result must say that bone selection was bypas
 
 ## Shader
 
-### 0.0.10 continuous surface-distance fade
+### 0.0.11 validation shader
 
-The stepped shell approximation has been removed.
+The 0.0.10 surface-fragment fade was rejected because it only darkened rendered mesh fragments and did not behave as an enclosing proximity field.
 
-The shader now uses three passes total:
+0.0.11 returns to closed-volume shell detection, but changes the layout substantially.
 
-1. **CORE_PARITY** — stencil parity determines whether each camera ray starts inside the closed proxy;
-2. **SURFACE_FADE** — outside only, one surface pass computes continuous camera-to-fragment distance;
-3. **CORE_BLACK** — inside only, applies `Core Black Strength` and clears the stencil bit.
+The shader uses:
 
-Outside the proxy, the fade value is evaluated per fragment:
+- eight nested fade shells;
+- one inward-shrunk core volume;
+- stencil parity for every shell/core;
+- cumulative alpha compensation;
+- optional subtle screen-space dithering.
+
+The fade shells span the full interval:
 
 ```text
-surfaceDistance = distance(camera, proxy surface fragment)
-proximity       = 1 - surfaceDistance / FadeDistance
-opacity         = smoothstep(0, 1, proximity)
-                  * CoreBlackStrength
-                  * FadeToCore
++Fade Distance
+      |
+      | outer fade
+      |
+body proxy surface
+      |
+      | inner fade
+      |
+-Core Inset
+      |
+     Core
 ```
 
-There are no expanded fade shells and therefore no spatial band boundaries.
+So the body surface is no longer the mandatory point where the fade ends. The transition can continue inside the proxy before the solid-black core starts.
 
-`Fade To Core = 100%` is the continuity setting: immediately outside the proxy surface, the fade approaches the same opacity used by the core. Lower values intentionally leave a darker jump when the camera crosses into the core.
+#### Shell placement
 
-The fade pass runs only where the parity stencil says the camera is outside the proxy. The core pass runs only where parity says it is inside.
+Eight shell samples use band midpoints, then pass those through a smoothstep-shaped position mapping. This makes shell positions denser near the outer edge and near the core boundary.
 
-This changes the rendering cost from the 0.0.9 ten-pass shell implementation to three passes.
+Each shell contributes one eighth of the requested cumulative fade opacity. Keeping per-shell opacity increments equal minimizes the size of each temporal brightness jump.
 
-Important limitation: this is camera-to-rendered-surface-fragment distance, not an exact nearest-point signed distance field. It is intended as a practical continuous proximity fade for the body-following proxy.
+#### Core Inset
+
+`Core Inset` moves the core volume inward along skinned vertex normals.
+
+This is useful for delaying solid black until the camera has penetrated slightly past the body surface.
+
+Large negative-normal offsets can self-intersect or collapse in thin/concave regions, so this is a validation control rather than a guaranteed geometric operation. Values around 0.005-0.015 m are the recommended first test range.
+
+#### Shell Dither
+
+`Shell Dither` adds a small stable screen-space variation to each shell's incremental alpha. It does not make the distance field mathematically continuous; it is intended only to break up a uniform full-screen shell step.
+
+Set it to 0 to compare pure eight-shell behavior.
+
+#### Cost
+
+Eight shells plus the core require:
+
+```text
+8 shells x (parity + color) = 16 passes
+1 core   x (parity + color) =  2 passes
+---------------------------------------
+total                         18 passes
+```
+
+This is deliberately a quality/performance validation shader. The generated proxy is expected to be heavily reduced before deciding whether this pass count is acceptable.
 
 The shader uses stencil bit `128`.
 
@@ -225,9 +262,8 @@ The simple cap generator is intentionally not suitable for visible rendering; it
 - The topology-safe reducer is intentionally conservative and may stop well above very aggressive target ratios.
 - It uses shortest-edge style collapse cost with normal and skin-weight penalties rather than a full production QEM implementation.
 - Complex branching/non-manifold boundary loops may not be sealable by the simple fan-cap implementation.
-- Self-intersection is not resolved.
-- The volume shader uses three passes and stencil bit 128.
-- Continuous surface fade is based on camera-to-fragment distance, not a true animated SDF / exact nearest-point distance.
+- Self-intersection is not resolved. Inward Core Inset can therefore fail on sufficiently thin or concave geometry.
+- The 0.0.11 validation shader uses eighteen passes and stencil bit 128.
 - Runtime/VR validation is still required before merging to `dev`.
 - Editor-time simplification cost increases with source polygon count and aggressive quality targets.
 

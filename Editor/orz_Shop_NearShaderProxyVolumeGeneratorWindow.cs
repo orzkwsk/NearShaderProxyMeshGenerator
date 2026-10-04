@@ -65,7 +65,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             _surfaceOffset = 0f;
 
             // Boundary-bone semantics from 0.0.2-0.0.4 are intentionally discarded.
-            // 0.0.5 uses explicit included-bone selection.
+            // 0.0.5+ uses explicit included-bone selection; 0.0.6 resets quality to the safe 100% default.
             SelectAllSourceBones();
 
             _uiVersion = CurrentUiVersion;

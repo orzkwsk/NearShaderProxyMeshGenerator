@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.8
+// Prototype version: 0.0.9
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 8;
+        private const int CurrentUiVersion = 9;
 
         [SerializeField] private int _uiVersion;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -83,7 +83,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.8: checked bones are the INCLUDED proxy region. " +
+                "Prototype 0.0.9: checked bones are the INCLUDED proxy region. " +
                 "A vertex is selected by the summed skin weight of checked bones. " +
                 "When all renderer bones are checked, selection filtering is bypassed and the full source body is used.",
                 MessageType.Info);
@@ -425,9 +425,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     1f);
 
             EditorGUILayout.HelpBox(
-                "Fade To Core now controls the fade endpoint relative to Core Black Strength. " +
-                "At 100%, the fade reaches core darkness before entering the core; at 0%, only the core darkens. " +
-                "The outer shell remains intentionally subtle at 20% of the selected fade endpoint.",
+                "Fade To Core controls the fade endpoint relative to Core Black Strength. " +
+                "0.0.9 uses four nested fade bands at 100/75/50/25% of Fade Distance and a smoothstep opacity curve, " +
+                "then enters the core. This is still a stepped approximation, but the transitions are much finer than the old Outer/Mid/Core model.",
                 MessageType.None);
         }
 

@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.11
+// Prototype version: 0.0.12
 //
 // Selection model rewrite:
 // - Checked bones are the INCLUDED proxy region.
@@ -381,6 +381,13 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             int boundaryAfterSeal = afterEdges.Count(pair => pair.Value.Count == 1);
             int nonManifoldAfterSeal = afterEdges.Count(pair => pair.Value.Count > 2);
 
+            // Keep geometry diagnostics/topology independent from the render helper.
+            // The shader uses this one tagged triangle for all fullscreen color resolves,
+            // while the actual proxy triangles are used only for stencil parity.
+            int proxyGeometryVertexCount = proxyMesh.vertexCount;
+            int proxyGeometryTriangleCount = proxyMesh.triangles.Length / 3;
+            AppendFullscreenResolveTriangle(proxyMesh);
+
             EnsureAssetFolder(outputFolder);
 
             string safeName = MakeSafeFileName(source.gameObject.name + ProxySuffix);
@@ -450,8 +457,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 SelectionVertexCount = selectionVertexCount,
                 SelectionTriangleCount = selectionTriangleCount,
 
-                ProxyVertexCount = proxyMesh.vertexCount,
-                ProxyTriangleCount = proxyMesh.triangles.Length / 3,
+                ProxyVertexCount = proxyGeometryVertexCount,
+                ProxyTriangleCount = proxyGeometryTriangleCount,
 
                 PreSimplifyTriangleCount = preSimplifyTriangleCount,
                 TargetTriangleCount = simplification.TargetTriangleCount,
@@ -1979,6 +1986,99 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             }
 
             mesh.vertices = vertices;
+            mesh.RecalculateBounds();
+        }
+
+
+        private static void AppendFullscreenResolveTriangle(
+            Mesh mesh)
+        {
+            if (mesh == null)
+                throw new ArgumentNullException(nameof(mesh));
+
+            var vertices =
+                mesh.vertices.ToList();
+
+            var normals =
+                mesh.normals != null &&
+                mesh.normals.Length == mesh.vertexCount
+                    ? mesh.normals.ToList()
+                    : Enumerable.Repeat(
+                        Vector3.forward,
+                        mesh.vertexCount).ToList();
+
+            var uvs =
+                mesh.uv != null &&
+                mesh.uv.Length == mesh.vertexCount
+                    ? mesh.uv.ToList()
+                    : Enumerable.Repeat(
+                        Vector2.zero,
+                        mesh.vertexCount).ToList();
+
+            var weights =
+                mesh.boneWeights != null &&
+                mesh.boneWeights.Length == mesh.vertexCount
+                    ? mesh.boneWeights.ToList()
+                    : Enumerable.Repeat(
+                        new BoneWeight
+                        {
+                            boneIndex0 = 0,
+                            weight0 = 1f
+                        },
+                        mesh.vertexCount).ToList();
+
+            var renderData =
+                Enumerable.Repeat(
+                    Vector4.zero,
+                    mesh.vertexCount).ToList();
+
+            int baseIndex =
+                vertices.Count;
+
+            // Object-space position is intentionally irrelevant. The volume
+            // shader recognizes RenderData.z == 1 and generates clip-space
+            // positions directly from RenderData.xy.
+            for (int i = 0; i < 3; i++)
+            {
+                vertices.Add(Vector3.zero);
+                normals.Add(Vector3.forward);
+                uvs.Add(Vector2.zero);
+
+                weights.Add(
+                    weights.Count > 0
+                        ? weights[0]
+                        : new BoneWeight
+                        {
+                            boneIndex0 = 0,
+                            weight0 = 1f
+                        });
+            }
+
+            // One oversized fullscreen triangle:
+            // uv -> clip = uv * 2 - 1
+            // (0,0), (2,0), (0,2) -> (-1,-1), (3,-1), (-1,3)
+            renderData.Add(new Vector4(0f, 0f, 1f, 0f));
+            renderData.Add(new Vector4(2f, 0f, 1f, 0f));
+            renderData.Add(new Vector4(0f, 2f, 1f, 0f));
+
+            var triangles =
+                mesh.triangles.ToList();
+
+            triangles.Add(baseIndex);
+            triangles.Add(baseIndex + 1);
+            triangles.Add(baseIndex + 2);
+
+            mesh.indexFormat =
+                vertices.Count > 65535
+                    ? IndexFormat.UInt32
+                    : IndexFormat.UInt16;
+
+            mesh.SetVertices(vertices);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            mesh.SetUVs(1, renderData);
+            mesh.boneWeights = weights.ToArray();
+            mesh.SetTriangles(triangles, 0, true);
             mesh.RecalculateBounds();
         }
 

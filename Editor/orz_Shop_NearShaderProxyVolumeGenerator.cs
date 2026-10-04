@@ -1612,15 +1612,15 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             var values =
                 new Dictionary<int, float>();
 
-            AddInfluence(values, a.boneIndex0, a.weight0);
-            AddInfluence(values, a.boneIndex1, a.weight1);
-            AddInfluence(values, a.boneIndex2, a.weight2);
-            AddInfluence(values, a.boneIndex3, a.weight3);
+            AddSignedInfluence(values, a.boneIndex0, a.weight0);
+            AddSignedInfluence(values, a.boneIndex1, a.weight1);
+            AddSignedInfluence(values, a.boneIndex2, a.weight2);
+            AddSignedInfluence(values, a.boneIndex3, a.weight3);
 
-            AddInfluence(values, b.boneIndex0, -b.weight0);
-            AddInfluence(values, b.boneIndex1, -b.weight1);
-            AddInfluence(values, b.boneIndex2, -b.weight2);
-            AddInfluence(values, b.boneIndex3, -b.weight3);
+            AddSignedInfluence(values, b.boneIndex0, -b.weight0);
+            AddSignedInfluence(values, b.boneIndex1, -b.weight1);
+            AddSignedInfluence(values, b.boneIndex2, -b.weight2);
+            AddSignedInfluence(values, b.boneIndex3, -b.weight3);
 
             float distance = 0f;
 
@@ -1628,6 +1628,20 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 distance += Mathf.Abs(value);
 
             return Mathf.Clamp01(distance * 0.5f);
+        }
+
+        private static void AddSignedInfluence(
+            Dictionary<int, float> target,
+            int boneIndex,
+            float weight)
+        {
+            if (Mathf.Abs(weight) <= 1e-8f)
+                return;
+
+            if (target.TryGetValue(boneIndex, out float current))
+                target[boneIndex] = current + weight;
+            else
+                target.Add(boneIndex, weight);
         }
 
         private static void CompactSimplifiedMesh(

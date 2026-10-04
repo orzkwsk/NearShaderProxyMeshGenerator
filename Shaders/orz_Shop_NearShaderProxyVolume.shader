@@ -1,7 +1,6 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.9
-// Closed-volume camera proximity effect using stencil parity.
-// Four fade shells approximate a smooth spatial gradient before the core.
+// Prototype version: 0.0.10
+// Continuous camera-to-surface fade + stencil-parity core blackout.
 
 Shader "orz_Shop/NearShaderProxyVolume"
 {
@@ -9,8 +8,8 @@ Shader "orz_Shop/NearShaderProxyVolume"
     {
         _Color ("Color", Color) = (0,0,0,1)
         _CoreStrength ("Core Black Strength", Range(0,1)) = 1
-        _FadeDistance ("Outer Fade Distance (m)", Range(0,0.25)) = 0.05
-        _FadeStrength ("Fade To Core", Range(0,1)) = 0.2
+        _FadeDistance ("Fade Distance (m)", Range(0,0.25)) = 0.05
+        _FadeStrength ("Fade To Core", Range(0,1)) = 1
     }
 
     SubShader
@@ -33,293 +32,75 @@ Shader "orz_Shop/NearShaderProxyVolume"
         struct appdata
         {
             float4 vertex : POSITION;
-            float3 normal : NORMAL;
         };
 
-        struct v2f
+        struct v2fSurface
+        {
+            float4 pos : SV_POSITION;
+            float3 worldPos : TEXCOORD0;
+        };
+
+        struct v2fCore
         {
             float4 pos : SV_POSITION;
         };
 
-        v2f ExpandVertex(appdata v, float distance)
+        v2fSurface VertSurface(appdata v)
         {
-            v2f o;
-            float3 worldPosition = mul(unity_ObjectToWorld, v.vertex).xyz;
-            float3 worldNormal = UnityObjectToWorldNormal(v.normal);
-            worldPosition += normalize(worldNormal) * distance;
-            o.pos = UnityWorldToClipPos(worldPosition);
+            v2fSurface o;
+            float4 world = mul(unity_ObjectToWorld, v.vertex);
+            o.worldPos = world.xyz;
+            o.pos = UnityWorldToClipPos(world.xyz);
             return o;
         }
 
-        v2f VertFade1(appdata v) { return ExpandVertex(v, _FadeDistance); }
-        v2f VertFade2(appdata v) { return ExpandVertex(v, _FadeDistance * 0.75); }
-        v2f VertFade3(appdata v) { return ExpandVertex(v, _FadeDistance * 0.50); }
-        v2f VertFade4(appdata v) { return ExpandVertex(v, _FadeDistance * 0.25); }
-        v2f VertCore (appdata v) { return ExpandVertex(v, 0.0); }
-
-        // Convert desired cumulative opacity into the alpha needed for only
-        // this pass, because nested shells are blended sequentially.
-        float IncrementalAlpha(float previousOpacity, float targetOpacity)
+        v2fCore VertCore(appdata v)
         {
-            previousOpacity = saturate(previousOpacity);
-            targetOpacity = saturate(max(previousOpacity, targetOpacity));
-
-            float remaining = max(1.0 - previousOpacity, 1e-5);
-            return saturate((targetOpacity - previousOpacity) / remaining);
+            v2fCore o;
+            o.pos = UnityObjectToClipPos(v.vertex);
+            return o;
         }
 
-        float FadeTargetOpacity()
+        fixed4 FragSurface(v2fSurface i) : SV_Target
         {
-            return saturate(_CoreStrength * _FadeStrength);
-        }
+            float fadeDistance = max(_FadeDistance, 1e-5);
+            float surfaceDistance = distance(_WorldSpaceCameraPos, i.worldPos);
 
-        float SmoothFadeOpacity(float proximity)
-        {
-            // smoothstep(0, 1, proximity), written explicitly for predictable
-            // behavior on older Unity shader targets.
-            proximity = saturate(proximity);
+            if (surfaceDistance >= fadeDistance)
+                discard;
+
+            // 0 at the outer edge, 1 at the proxy surface.
+            float proximity = saturate(1.0 - surfaceDistance / fadeDistance);
+
+            // Continuous ease-in/ease-out. Unlike the old nested-shell approach,
+            // this value is evaluated per fragment and therefore has no spatial bands.
             float eased = proximity * proximity * (3.0 - 2.0 * proximity);
-            return FadeTargetOpacity() * eased;
-        }
 
-        fixed4 FragFade1(v2f i) : SV_Target
-        {
-            // Representative point for the outermost 25% band.
-            float target = SmoothFadeOpacity(0.125);
-            return fixed4(_Color.rgb, target);
-        }
-
-        fixed4 FragFade2(v2f i) : SV_Target
-        {
-            float previous = SmoothFadeOpacity(0.125);
-            float target = SmoothFadeOpacity(0.375);
-            return fixed4(_Color.rgb, IncrementalAlpha(previous, target));
-        }
-
-        fixed4 FragFade3(v2f i) : SV_Target
-        {
-            float previous = SmoothFadeOpacity(0.375);
-            float target = SmoothFadeOpacity(0.625);
-            return fixed4(_Color.rgb, IncrementalAlpha(previous, target));
-        }
-
-        fixed4 FragFade4(v2f i) : SV_Target
-        {
-            float previous = SmoothFadeOpacity(0.625);
-            float target = SmoothFadeOpacity(0.875);
-            return fixed4(_Color.rgb, IncrementalAlpha(previous, target));
-        }
-
-        fixed4 FragCore(v2f i) : SV_Target
-        {
-            float previous = SmoothFadeOpacity(0.875);
-            float target = saturate(_CoreStrength);
+            float targetOpacity =
+                saturate(_CoreStrength * _FadeStrength);
 
             return fixed4(
                 _Color.rgb,
-                IncrementalAlpha(previous, target));
+                saturate(targetOpacity * eased));
         }
 
-        fixed4 FragMask(v2f i) : SV_Target
+        fixed4 FragCore(v2fCore i) : SV_Target
+        {
+            return fixed4(
+                _Color.rgb,
+                saturate(_CoreStrength));
+        }
+
+        fixed4 FragMask(v2fCore i) : SV_Target
         {
             return 0;
         }
         ENDCG
 
         // ---------------------------------------------------------------------
-        // Fade band 1: 100% of Fade Distance
-        Pass
-        {
-            Name "FADE1_PARITY"
-            Cull Off
-            ZWrite Off
-            ZTest Always
-            ColorMask 0
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Always
-                Pass Invert
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade1
-            #pragma fragment FragMask
-            ENDCG
-        }
-
-        Pass
-        {
-            Name "FADE1_COLOR"
-            Blend SrcAlpha OneMinusSrcAlpha
-            Cull Off
-            ZWrite Off
-            ZTest Always
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Equal
-                Pass Zero
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade1
-            #pragma fragment FragFade1
-            ENDCG
-        }
-
-        // ---------------------------------------------------------------------
-        // Fade band 2: 75% of Fade Distance
-        Pass
-        {
-            Name "FADE2_PARITY"
-            Cull Off
-            ZWrite Off
-            ZTest Always
-            ColorMask 0
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Always
-                Pass Invert
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade2
-            #pragma fragment FragMask
-            ENDCG
-        }
-
-        Pass
-        {
-            Name "FADE2_COLOR"
-            Blend SrcAlpha OneMinusSrcAlpha
-            Cull Off
-            ZWrite Off
-            ZTest Always
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Equal
-                Pass Zero
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade2
-            #pragma fragment FragFade2
-            ENDCG
-        }
-
-        // ---------------------------------------------------------------------
-        // Fade band 3: 50% of Fade Distance
-        Pass
-        {
-            Name "FADE3_PARITY"
-            Cull Off
-            ZWrite Off
-            ZTest Always
-            ColorMask 0
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Always
-                Pass Invert
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade3
-            #pragma fragment FragMask
-            ENDCG
-        }
-
-        Pass
-        {
-            Name "FADE3_COLOR"
-            Blend SrcAlpha OneMinusSrcAlpha
-            Cull Off
-            ZWrite Off
-            ZTest Always
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Equal
-                Pass Zero
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade3
-            #pragma fragment FragFade3
-            ENDCG
-        }
-
-        // ---------------------------------------------------------------------
-        // Fade band 4: 25% of Fade Distance
-        Pass
-        {
-            Name "FADE4_PARITY"
-            Cull Off
-            ZWrite Off
-            ZTest Always
-            ColorMask 0
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Always
-                Pass Invert
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade4
-            #pragma fragment FragMask
-            ENDCG
-        }
-
-        Pass
-        {
-            Name "FADE4_COLOR"
-            Blend SrcAlpha OneMinusSrcAlpha
-            Cull Off
-            ZWrite Off
-            ZTest Always
-
-            Stencil
-            {
-                Ref 128
-                ReadMask 128
-                WriteMask 128
-                Comp Equal
-                Pass Zero
-            }
-
-            CGPROGRAM
-            #pragma vertex VertFade4
-            #pragma fragment FragFade4
-            ENDCG
-        }
-
-        // ---------------------------------------------------------------------
-        // Core
+        // 1) Determine whether each camera ray starts inside the closed proxy.
+        // Outside rays cross the closed surface an even number of times (stencil 0).
+        // Inside rays cross it an odd number of times (stencil 128).
         Pass
         {
             Name "CORE_PARITY"
@@ -343,6 +124,35 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ENDCG
         }
 
+        // ---------------------------------------------------------------------
+        // 2) Outside only: draw the actual proxy surface once and calculate
+        // continuous camera-to-fragment distance. Cull Back keeps the inside
+        // surface from stacking an additional fade under the core blackout.
+        Pass
+        {
+            Name "SURFACE_FADE"
+            Blend SrcAlpha OneMinusSrcAlpha
+            Cull Back
+            ZWrite Off
+            ZTest Always
+
+            Stencil
+            {
+                Ref 128
+                ReadMask 128
+                WriteMask 128
+                Comp NotEqual
+                Pass Keep
+            }
+
+            CGPROGRAM
+            #pragma vertex VertSurface
+            #pragma fragment FragSurface
+            ENDCG
+        }
+
+        // ---------------------------------------------------------------------
+        // 3) Inside only: draw the closed-volume blackout and clear our stencil bit.
         Pass
         {
             Name "CORE_BLACK"

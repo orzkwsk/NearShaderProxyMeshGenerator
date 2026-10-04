@@ -12,7 +12,7 @@ The proxy is backing geometry for a camera near/proximity shader. It is not a vi
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## 0.0.11 eight-shell fade + inset core
+## 0.0.12 fullscreen stencil resolve
 
 Open:
 
@@ -171,9 +171,17 @@ When **Select All** is active, the result must say that bone selection was bypas
 
 ## Shader
 
-### 0.0.11 validation shader
+### 0.0.12 validation shader
 
 The 0.0.10 surface-fragment fade was rejected because it only darkened rendered mesh fragments and did not behave as an enclosing proximity field.
+
+The 0.0.12 renderer separates **volume detection** from **color application**.
+
+The proxy mesh is used only for stencil parity. Each shell/core then resolves its color with one generated fullscreen helper triangle.
+
+This prevents concave or overlapping proxy surfaces from blending the same fade level multiple times into one pixel. A pixel is darkened once per shell membership, independent of how many proxy faces project onto that pixel.
+
+The generated proxy asset therefore contains one additional tagged helper triangle (3 vertices / 1 triangle). It is appended only after sealing, simplification, and final topology diagnostics, so it is excluded from manifold validation and from the reported proxy geometry triangle count.
 
 0.0.11 returns to closed-volume shell detection, but changes the layout substantially.
 
@@ -207,7 +215,7 @@ So the body surface is no longer the mandatory point where the fade ends. The tr
 
 Eight shell samples use band midpoints, then pass those through a smoothstep-shaped position mapping. This makes shell positions denser near the outer edge and near the core boundary.
 
-Each shell contributes one eighth of the requested cumulative fade opacity. Keeping per-shell opacity increments equal minimizes the size of each temporal brightness jump.
+Each shell contributes one eighth of the requested cumulative fade opacity. Keeping per-shell opacity increments equal minimizes the size of each temporal brightness jump. The color resolve is fullscreen and stencil-gated, so mesh overlap no longer increases opacity.
 
 #### Core Inset
 

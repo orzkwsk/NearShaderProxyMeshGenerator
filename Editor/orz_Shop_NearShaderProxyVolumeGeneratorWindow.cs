@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.5
+// Prototype version: 0.0.6
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 5;
+        private const int CurrentUiVersion = 6;
 
         [SerializeField] private int _uiVersion;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -21,7 +21,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         [SerializeField] private string _boneFilter = string.Empty;
         [SerializeField] private float _selectionThreshold = 0.25f;
 
-        [SerializeField] private float _mergeSize = 0f;
+        [SerializeField] private float _meshQuality = 1f;
         [SerializeField] private float _surfaceOffset = 0f;
         [SerializeField] private bool _sealOpenBoundaries = true;
 
@@ -61,7 +61,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             }
 
             _selectionThreshold = 0.25f;
-            _mergeSize = 0f;
+            _meshQuality = 1f;
             _surfaceOffset = 0f;
 
             // Boundary-bone semantics from 0.0.2-0.0.4 are intentionally discarded.
@@ -81,7 +81,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.5: checked bones are the INCLUDED proxy region. " +
+                "Prototype 0.0.6: checked bones are the INCLUDED proxy region. " +
                 "A vertex is selected by the summed skin weight of checked bones. " +
                 "When all renderer bones are checked, selection filtering is bypassed and the full source body is used.",
                 MessageType.Info);
@@ -310,15 +310,19 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 "Proxy Geometry",
                 EditorStyles.boldLabel);
 
-            _mergeSize =
+            _meshQuality =
                 EditorGUILayout.Slider(
                     new GUIContent(
-                        "Merge Size",
-                        "0 = no intentional low-poly reduction. " +
-                        "Increase gradually after region extraction is confirmed."),
-                    _mergeSize,
-                    0f,
-                    0.05f);
+                        "Mesh Quality",
+                        "Target triangle ratio for topology-safe edge-collapse simplification. " +
+                        "100% disables simplification. The reducer stops early if further collapses would break closed-manifold topology or flip faces."),
+                    _meshQuality,
+                    0.10f,
+                    1.00f);
+
+            EditorGUILayout.LabelField(
+                "Target Triangle Ratio",
+                $"{_meshQuality:P0}");
 
             _surfaceOffset =
                 EditorGUILayout.Slider(
@@ -332,8 +336,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             using (new EditorGUILayout.HorizontalScope())
             {
-                if (GUILayout.Button("Reset Merge Size"))
-                    _mergeSize = 0f;
+                if (GUILayout.Button("Reset Quality"))
+                    _meshQuality = 1f;
 
                 if (GUILayout.Button("Reset Surface Offset"))
                     _surfaceOffset = 0f;
@@ -343,19 +347,20 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorGUILayout.Toggle(
                     new GUIContent(
                         "Seal Open Boundaries",
-                        "Fill open loops after extraction/welding. " +
-                        "Required for stencil-parity inside/outside detection."),
+                        "Fill open loops before simplification. Required for stencil-parity inside/outside detection."),
                     _sealOpenBoundaries);
 
             EditorGUILayout.HelpBox(
-                "Validation order: first use Merge Size = 0 and Surface Offset = 0. " +
-                "Confirm the selected region, then simplify.",
+                "Simplification is performed only after the proxy is sealed. " +
+                "Only connected interior edges are collapsed, and each pass is rejected if it creates boundary or non-manifold edges. " +
+                "The requested quality is a target, not a guarantee.",
                 MessageType.None);
 
-            if (_mergeSize > 0.025f)
+            if (_meshQuality < 0.25f)
             {
                 EditorGUILayout.HelpBox(
-                    "Large Merge Size can collapse thin limbs or join nearby surfaces.",
+                    "Very low quality can hit the topology/face-orientation limit before the target ratio is reached. " +
+                    "In that case the reducer intentionally stops early rather than creating stencil leaks.",
                     MessageType.Warning);
             }
         }
@@ -433,7 +438,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 _source != null &&
                 _source.sharedMesh != null &&
                 selectedCount > 0 &&
-                _mergeSize >= 0f &&
+                _meshQuality >= 0.1f &&
+                _meshQuality <= 1f &&
                 _fadeDistance >= 0f;
 
             using (new EditorGUI.DisabledScope(!canGenerate))
@@ -504,12 +510,44 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 _lastResult.SelectionTriangleCount.ToString("N0"));
 
             EditorGUILayout.LabelField(
+                "Triangles Before Simplify",
+                _lastResult.PreSimplifyTriangleCount.ToString("N0"));
+
+            EditorGUILayout.LabelField(
+                "Target Triangles",
+                _lastResult.TargetTriangleCount.ToString("N0"));
+
+            EditorGUILayout.LabelField(
                 "Proxy Vertices",
                 _lastResult.ProxyVertexCount.ToString("N0"));
 
             EditorGUILayout.LabelField(
                 "Proxy Triangles",
                 _lastResult.ProxyTriangleCount.ToString("N0"));
+
+            if (_lastResult.PreSimplifyTriangleCount > 0)
+            {
+                float achieved =
+                    (float)_lastResult.ProxyTriangleCount /
+                    _lastResult.PreSimplifyTriangleCount;
+
+                EditorGUILayout.LabelField(
+                    "Achieved Triangle Ratio",
+                    $"{achieved:P1}");
+            }
+
+            EditorGUILayout.LabelField(
+                "Safe Edge Collapses",
+                _lastResult.SimplificationCollapseCount.ToString("N0"));
+
+            if (_lastResult.SimplificationAttempted &&
+                !_lastResult.SimplificationReachedTarget)
+            {
+                EditorGUILayout.HelpBox(
+                    "Requested quality was not fully reached. " +
+                    (_lastResult.SimplificationStopReason ?? "The topology-safe limit was reached."),
+                    MessageType.Warning);
+            }
 
             if (_lastResult.SelectionBypassed)
             {
@@ -567,7 +605,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             {
                 EditorGUILayout.HelpBox(
                     "The generated proxy is not a clean closed 2-manifold. " +
-                    "Keep Merge Size at 0 while debugging selection.",
+                    "Topology-safe simplification will stop/skip rather than reduce this mesh further.",
                     MessageType.Warning);
             }
 
@@ -602,7 +640,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         _material,
                         _selectedBones,
                         _selectionThreshold,
-                        _mergeSize,
+                        _meshQuality,
                         _surfaceOffset,
                         _sealOpenBoundaries,
                         _fadeDistance,
@@ -625,7 +663,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     $"Selection bypass {_lastResult.SelectionBypassed}, " +
                     $"Source V/T {_lastResult.SourceVertexCount}/{_lastResult.SourceTriangleCount}, " +
                     $"Selected V/T {_lastResult.SelectionVertexCount}/{_lastResult.SelectionTriangleCount}, " +
-                    $"Proxy V/T {_lastResult.ProxyVertexCount}/{_lastResult.ProxyTriangleCount}, " +
+                    $"Simplify T {_lastResult.PreSimplifyTriangleCount}->{_lastResult.ProxyTriangleCount} " +
+                    $"(target {_lastResult.TargetTriangleCount}, collapses {_lastResult.SimplificationCollapseCount}), " +
+                    $"Proxy V {_lastResult.ProxyVertexCount}, " +
                     $"Boundary {_lastResult.BoundaryEdgesBeforeSeal}->{_lastResult.BoundaryEdgesAfterSeal}, " +
                     $"NonManifold {_lastResult.NonManifoldEdgesAfterSeal}.",
                     _lastResult.ProxyObject);

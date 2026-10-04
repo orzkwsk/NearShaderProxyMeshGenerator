@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.9
+// Prototype version: 0.0.10
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 9;
+        private const int CurrentUiVersion = 10;
 
         [SerializeField] private int _uiVersion;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -27,7 +27,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         [SerializeField] private bool _planarBoneCaps = true;
 
         [SerializeField] private float _fadeDistance = 0.05f;
-        [SerializeField] private float _fadeStrength = 0.2f;
+        [SerializeField] private float _fadeStrength = 1f;
         [SerializeField] private float _coreStrength = 1f;
 
         [SerializeField] private string _outputFolder = DefaultOutputFolder;
@@ -55,21 +55,28 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
         private void OnEnable()
         {
-            if (_uiVersion >= CurrentUiVersion)
+            if (_uiVersion < 5)
             {
-                SyncSelectedBones();
-                return;
+                _selectionThreshold = 0.25f;
+                SelectAllSourceBones();
             }
 
-            _selectionThreshold = 0.25f;
-            _meshQuality = 1f;
-            _surfaceOffset = 0f;
-            _planarBoneCaps = true;
+            if (_uiVersion < 6)
+            {
+                _meshQuality = 1f;
+                _surfaceOffset = 0f;
+            }
 
-            // Boundary-bone semantics from 0.0.2-0.0.4 are intentionally discarded.
-            // 0.0.5+ uses explicit included-bone selection; 0.0.6 resets quality to the safe 100% default.
-            SelectAllSourceBones();
+            if (_uiVersion < 7)
+                _planarBoneCaps = true;
 
+            // 0.0.10 changes Fade To Core from stepped shell strength to a
+            // continuous surface-distance endpoint. Default to continuity at
+            // the actual body surface instead of preserving the old weak 0.2.
+            if (_uiVersion < 10)
+                _fadeStrength = 1f;
+
+            SyncSelectedBones();
             _uiVersion = CurrentUiVersion;
         }
 
@@ -83,7 +90,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.9: checked bones are the INCLUDED proxy region. " +
+                "Prototype 0.0.10: checked bones are the INCLUDED proxy region. " +
                 "A vertex is selected by the summed skin weight of checked bones. " +
                 "When all renderer bones are checked, selection filtering is bypassed and the full source body is used.",
                 MessageType.Info);
@@ -399,7 +406,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorGUILayout.Slider(
                     new GUIContent(
                         "Fade Distance",
-                        "World-space normal expansion used by the outer shader shells."),
+                        "Maximum camera-to-proxy-surface distance that produces the outside fade. " +
+                        "The shader evaluates this continuously per fragment; no expanded fade shells are generated."),
                     _fadeDistance,
                     0f,
                     0.25f);
@@ -408,8 +416,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorGUILayout.Slider(
                     new GUIContent(
                         "Fade To Core",
-                        "How far the pre-core fade reaches toward Core Black Strength. " +
-                        "0% = no pre-core darkening; 100% = the mid shell already reaches the same darkness as the core."),
+                        "Opacity reached immediately outside the proxy surface, relative to Core Black Strength. " +
+                        "100% gives a continuous transition into the core; lower values intentionally leave a darkness jump at the surface."),
                     _fadeStrength,
                     0f,
                     1f);
@@ -418,16 +426,14 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorGUILayout.Slider(
                     new GUIContent(
                         "Core Black Strength",
-                        "Final cumulative black opacity inside the core volume. " +
-                        "Fade passes are compensated so this value remains the actual final darkness."),
+                        "Black opacity while the camera is inside the closed proxy volume."),
                     _coreStrength,
                     0f,
                     1f);
 
             EditorGUILayout.HelpBox(
-                "Fade To Core controls the fade endpoint relative to Core Black Strength. " +
-                "0.0.9 uses four nested fade bands at 100/75/50/25% of Fade Distance and a smoothstep opacity curve, " +
-                "then enters the core. This is still a stepped approximation, but the transitions are much finer than the old Outer/Mid/Core model.",
+                "0.0.10 removes nested fade shells. Outside the proxy, a single surface pass computes camera-to-fragment distance and applies a continuous smoothstep fade. " +
+                "Inside the proxy, stencil parity switches directly to Core Black Strength. Fade To Core = 100% is the seamless setting.",
                 MessageType.None);
         }
 

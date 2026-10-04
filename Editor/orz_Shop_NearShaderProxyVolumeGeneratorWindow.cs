@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.11
+// Prototype version: 0.0.12
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 11;
+        private const int CurrentUiVersion = 12;
 
         [SerializeField] private int _uiVersion;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -98,7 +98,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.11: checked bones are the INCLUDED proxy region. " +
+                "Prototype 0.0.12: checked bones are the INCLUDED proxy region. " +
                 "A vertex is selected by the summed skin weight of checked bones. " +
                 "When all renderer bones are checked, selection filtering is bypassed and the full source body is used.",
                 MessageType.Info);
@@ -468,9 +468,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     1f);
 
             EditorGUILayout.HelpBox(
-                "0.0.11 is a validation shader: eight nested closed-volume shells span from +Fade Distance to -Core Inset. " +
-                "Shell positions are denser near the outer edge and core boundary, each shell adds only 1/8 of the requested fade opacity, and optional dithering breaks up uniform steps. " +
-                "This costs 18 passes and is intended for quality/performance comparison.",
+                "0.0.12 keeps the eight nested closed-volume shells, but proxy geometry is now stencil-only. " +
+                "Each shell/core color is resolved by one tagged fullscreen helper triangle, so concave or overlapping proxy faces cannot apply the same fade alpha multiple times to one pixel. " +
+                "The shader remains 18 passes and is intended for quality/performance comparison.",
                 MessageType.None);
 
             if (_coreInset > 0.025f)

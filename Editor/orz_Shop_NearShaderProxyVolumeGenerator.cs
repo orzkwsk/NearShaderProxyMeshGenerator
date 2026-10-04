@@ -1,5 +1,11 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.4
+// Prototype version: 0.0.5
+//
+// Selection model rewrite:
+// - Checked bones are the INCLUDED proxy region.
+// - Vertex selection = sum of weights assigned to checked bones.
+// - All bones selected bypasses filtering and reproduces the full source mesh.
+// - Source skinning is read with BoneWeight1 so selection is not limited to four influences.
 
 using System;
 using System.Collections.Generic;
@@ -17,12 +23,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         internal const string ProxySuffix = "_NearShaderProxyVolume";
         internal const string ShaderName = "orz_Shop/NearShaderProxyVolume";
 
-        internal sealed class BoundaryDiagnostic
+        internal sealed class SelectedBoneDiagnostic
         {
             public string BoneName;
             public int BoneIndex;
-            public int DescendantBoneCount;
-            public int DistalVertexCount;
+            public int InfluencedVertexCount;
             public int SourceVertexCount;
         }
 
@@ -31,16 +36,22 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public GameObject ProxyObject;
             public Mesh ProxyMesh;
             public Material AssignedMaterial;
+
             public int SourceVertexCount;
             public int SourceTriangleCount;
+            public int SelectedBoneCount;
+            public int SelectionVertexCount;
+            public int SelectionTriangleCount;
+
             public int ProxyVertexCount;
             public int ProxyTriangleCount;
-            public int CutPlaneCount;
-            public int SkippedBoundaryCount;
+
             public int BoundaryEdgesBeforeSeal;
             public int BoundaryEdgesAfterSeal;
             public int NonManifoldEdgesAfterSeal;
-            public List<BoundaryDiagnostic> BoundaryDiagnostics;
+
+            public bool SelectionBypassed;
+            public List<SelectedBoneDiagnostic> SelectedBoneDiagnostics;
         }
 
         private struct VertexData
@@ -49,31 +60,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public Vector3 Normal;
             public Vector2 Uv;
             public BoneWeight BoneWeight;
-        }
-
-        private sealed class BoneBoundary
-        {
-            public Transform Bone;
-            public int BoneIndex;
-            public int DescendantBoneCount;
-            public bool[] DistalBoneMask;
-
-            public float DistalWeight(BoneWeight weight)
-            {
-                float sum = 0f;
-                if (IsDistal(weight.boneIndex0)) sum += weight.weight0;
-                if (IsDistal(weight.boneIndex1)) sum += weight.weight1;
-                if (IsDistal(weight.boneIndex2)) sum += weight.weight2;
-                if (IsDistal(weight.boneIndex3)) sum += weight.weight3;
-                return sum;
-            }
-
-            private bool IsDistal(int boneIndex)
-            {
-                return boneIndex >= 0 &&
-                       boneIndex < DistalBoneMask.Length &&
-                       DistalBoneMask[boneIndex];
-            }
+            public float SelectionWeight;
         }
 
         private sealed class Cluster
@@ -81,6 +68,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public Vector3 PositionSum;
             public Vector3 NormalSum;
             public Vector2 UvSum;
+            public float SelectionWeightSum;
             public int Count;
             public readonly Dictionary<int, float> BoneWeights = new Dictionary<int, float>();
 
@@ -89,6 +77,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 PositionSum += vertex.Position;
                 NormalSum += vertex.Normal;
                 UvSum += vertex.Uv;
+                SelectionWeightSum += vertex.SelectionWeight;
                 Count++;
                 AccumulateBoneWeight(BoneWeights, vertex.BoneWeight, 1f);
             }
@@ -107,8 +96,15 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 _z = Mathf.RoundToInt(position.z / cellSize);
             }
 
-            public bool Equals(GridKey other) => _x == other._x && _y == other._y && _z == other._z;
-            public override bool Equals(object obj) => obj is GridKey other && Equals(other);
+            public bool Equals(GridKey other)
+            {
+                return _x == other._x && _y == other._y && _z == other._z;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is GridKey other && Equals(other);
+            }
 
             public override int GetHashCode()
             {
@@ -141,9 +137,20 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 }
             }
 
-            public bool Equals(EdgeKey other) => A == other.A && B == other.B;
-            public override bool Equals(object obj) => obj is EdgeKey other && Equals(other);
-            public override int GetHashCode() => (A * 397) ^ B;
+            public bool Equals(EdgeKey other)
+            {
+                return A == other.A && B == other.B;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is EdgeKey other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                return (A * 397) ^ B;
+            }
         }
 
         private sealed class EdgeInfo
@@ -177,16 +184,27 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 b = t;
             }
 
-            public bool Equals(TriangleKey other) => _a == other._a && _b == other._b && _c == other._c;
-            public override bool Equals(object obj) => obj is TriangleKey other && Equals(other);
-            public override int GetHashCode() => ((_a * 397) ^ _b) * 397 ^ _c;
+            public bool Equals(TriangleKey other)
+            {
+                return _a == other._a && _b == other._b && _c == other._c;
+            }
+
+            public override bool Equals(object obj)
+            {
+                return obj is TriangleKey other && Equals(other);
+            }
+
+            public override int GetHashCode()
+            {
+                return ((_a * 397) ^ _b) * 397 ^ _c;
+            }
         }
 
         internal static GenerationResult Generate(
             SkinnedMeshRenderer source,
             Material requestedMaterial,
-            IReadOnlyList<Transform> cutoffBones,
-            float boneCutBias,
+            IReadOnlyList<Transform> selectedBones,
+            float selectionThreshold,
             float mergeSize,
             float surfaceOffset,
             bool sealOpenBoundaries,
@@ -198,50 +216,84 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         {
             if (source == null)
                 throw new ArgumentNullException(nameof(source));
+
             if (source.sharedMesh == null)
                 throw new InvalidOperationException("Source SkinnedMeshRenderer has no sharedMesh.");
+
             if (mergeSize < 0f)
                 throw new ArgumentOutOfRangeException(nameof(mergeSize), "Merge Size must not be negative.");
+
+            if (selectionThreshold < 0f || selectionThreshold > 1f)
+                throw new ArgumentOutOfRangeException(nameof(selectionThreshold), "Selection Threshold must be between 0 and 1.");
+
             if (fadeDistance < 0f)
                 throw new ArgumentOutOfRangeException(nameof(fadeDistance), "Fade Distance must not be negative.");
-            if (string.IsNullOrWhiteSpace(outputFolder) || !outputFolder.StartsWith("Assets", StringComparison.Ordinal))
+
+            if (string.IsNullOrWhiteSpace(outputFolder) ||
+                !outputFolder.StartsWith("Assets", StringComparison.Ordinal))
+            {
                 throw new ArgumentException("Output folder must be inside Assets/.", nameof(outputFolder));
+            }
+
+            Transform[] rendererBones = source.bones ?? Array.Empty<Transform>();
+            if (rendererBones.Length == 0)
+                throw new InvalidOperationException("Source renderer has no bones.");
+
+            bool[] selectedBoneMask = BuildSelectedBoneMask(
+                rendererBones,
+                selectedBones,
+                out int selectedBoneCount,
+                out bool allRendererBonesSelected);
+
+            if (selectedBoneCount == 0)
+                throw new InvalidOperationException("No proxy target bones are selected.");
 
             Mesh sourceMesh = source.sharedMesh;
-            ReadSourceMesh(
+
+            ReadSourceGeometry(
                 sourceMesh,
-                source.bones,
                 out Vector3[] sourceVertices,
                 out Vector3[] sourceNormals,
                 out Vector2[] sourceUvs,
-                out BoneWeight[] sourceBoneWeights,
                 out List<int> sourceTriangles);
 
-            List<BoneBoundary> boundaries = BuildBoneBoundaries(source, cutoffBones, out int skippedBoundaryCount);
-            float distalThreshold = Mathf.Clamp(0.5f + boneCutBias, 0.01f, 0.99f);
-            List<BoundaryDiagnostic> boundaryDiagnostics =
-                BuildBoundaryDiagnostics(boundaries, sourceBoneWeights, distalThreshold);
+            ReadSourceSkinning(
+                sourceMesh,
+                rendererBones.Length,
+                selectedBoneMask,
+                out BoneWeight[] sourceBoneWeights,
+                out float[] sourceSelectionWeights,
+                out int[] influencedVertexCountPerBone);
 
-            ClipGeometryByBoneBoundaries(
+            int selectionVertexCount = allRendererBonesSelected
+                ? sourceVertices.Length
+                : CountSelectedVertices(sourceSelectionWeights, selectionThreshold);
+
+            ExtractSelectedGeometry(
                 sourceVertices,
                 sourceNormals,
                 sourceUvs,
                 sourceBoneWeights,
+                sourceSelectionWeights,
                 sourceTriangles,
-                boundaries,
-                distalThreshold,
-                out List<VertexData> clippedVertices,
-                out List<int> clippedTriangles);
+                selectionThreshold,
+                allRendererBonesSelected,
+                out List<VertexData> selectedVertices,
+                out List<int> selectedTriangles);
 
-            if (clippedTriangles.Count == 0)
+            if (selectedTriangles.Count == 0)
+            {
                 throw new InvalidOperationException(
-                    "All triangles were removed by the selected bone boundaries. " +
-                    "Move Bone Cut Bias toward +, or remove an incorrect boundary bone.");
+                    "The selected bones produced no geometry. " +
+                    "Select additional bones or lower Selection Threshold.");
+            }
+
+            int selectionTriangleCount = selectedTriangles.Count / 3;
 
             Mesh proxyMesh = BuildProxy(
                 sourceMesh,
-                clippedVertices,
-                clippedTriangles,
+                selectedVertices,
+                selectedTriangles,
                 mergeSize,
                 surfaceOffset);
 
@@ -256,6 +308,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             int nonManifoldAfterSeal = afterEdges.Count(pair => pair.Value.Count > 2);
 
             EnsureAssetFolder(outputFolder);
+
             string safeName = MakeSafeFileName(source.gameObject.name + ProxySuffix);
             string meshPath = $"{outputFolder}/{safeName}.asset";
             string materialPath = $"{outputFolder}/{safeName}_Volume.mat";
@@ -270,12 +323,14 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             Material material = requestedMaterial;
             if (material == null)
+            {
                 material = GetOrCreateVolumeMaterial(
                     materialPath,
                     replaceExisting,
                     fadeDistance,
                     fadeStrength,
                     coreStrength);
+            }
 
             Transform existing = source.transform.Find(source.gameObject.name + ProxySuffix);
             if (existing != null && replaceExisting)
@@ -283,6 +338,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             GameObject proxyObject = new GameObject(source.gameObject.name + ProxySuffix);
             Undo.RegisterCreatedObjectUndo(proxyObject, "Generate Near Shader Proxy Volume");
+
             proxyObject.transform.SetParent(source.transform, false);
             proxyObject.transform.localPosition = Vector3.zero;
             proxyObject.transform.localRotation = Quaternion.identity;
@@ -290,7 +346,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             SkinnedMeshRenderer proxyRenderer = proxyObject.AddComponent<SkinnedMeshRenderer>();
             proxyRenderer.sharedMesh = proxyMesh;
-            proxyRenderer.bones = source.bones;
+            proxyRenderer.bones = rendererBones;
             proxyRenderer.rootBone = source.rootBone;
             proxyRenderer.quality = source.quality;
             proxyRenderer.updateWhenOffscreen = true;
@@ -311,25 +367,38 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 ProxyObject = proxyObject,
                 ProxyMesh = proxyMesh,
                 AssignedMaterial = material,
+
                 SourceVertexCount = sourceVertices.Length,
                 SourceTriangleCount = sourceTriangles.Count / 3,
+                SelectedBoneCount = selectedBoneCount,
+                SelectionVertexCount = selectionVertexCount,
+                SelectionTriangleCount = selectionTriangleCount,
+
                 ProxyVertexCount = proxyMesh.vertexCount,
                 ProxyTriangleCount = proxyMesh.triangles.Length / 3,
-                CutPlaneCount = boundaries.Count,
-                SkippedBoundaryCount = skippedBoundaryCount,
+
                 BoundaryEdgesBeforeSeal = boundaryBeforeSeal,
                 BoundaryEdgesAfterSeal = boundaryAfterSeal,
                 NonManifoldEdgesAfterSeal = nonManifoldAfterSeal,
-                BoundaryDiagnostics = boundaryDiagnostics
+
+                SelectionBypassed = allRendererBonesSelected,
+                SelectedBoneDiagnostics = BuildSelectedBoneDiagnostics(
+                    rendererBones,
+                    selectedBoneMask,
+                    influencedVertexCountPerBone,
+                    sourceVertices.Length)
             };
         }
 
-        internal static bool DeleteGeneratedProxy(SkinnedMeshRenderer source, string outputFolder)
+        internal static bool DeleteGeneratedProxy(
+            SkinnedMeshRenderer source,
+            string outputFolder)
         {
             if (source == null)
                 return false;
 
             bool changed = false;
+
             Transform child = source.transform.Find(source.gameObject.name + ProxySuffix);
             if (child != null)
             {
@@ -342,6 +411,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             {
                 string safeName = MakeSafeFileName(source.gameObject.name + ProxySuffix);
                 string meshPath = $"{outputFolder}/{safeName}.asset";
+
                 if (AssetDatabase.LoadAssetAtPath<Mesh>(meshPath) != null)
                 {
                     AssetDatabase.DeleteAsset(meshPath);
@@ -355,584 +425,119 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             return changed;
         }
 
-        private static List<BoneBoundary> BuildBoneBoundaries(
-            SkinnedMeshRenderer source,
-            IReadOnlyList<Transform> cutoffBones,
-            out int skippedBoundaryCount)
+        private static bool[] BuildSelectedBoneMask(
+            IReadOnlyList<Transform> rendererBones,
+            IReadOnlyList<Transform> selectedBones,
+            out int selectedBoneCount,
+            out bool allRendererBonesSelected)
         {
-            skippedBoundaryCount = 0;
-            var result = new List<BoneBoundary>();
+            var mask = new bool[rendererBones.Count];
+            selectedBoneCount = 0;
 
-            if (cutoffBones == null || cutoffBones.Count == 0)
-                return result;
-
-            Transform[] bones = source.bones ?? Array.Empty<Transform>();
-            var seen = new HashSet<Transform>();
-
-            foreach (Transform boundaryBone in cutoffBones)
+            if (selectedBones != null)
             {
-                if (boundaryBone == null || !seen.Add(boundaryBone))
-                    continue;
+                var selectedSet = new HashSet<Transform>(
+                    selectedBones.Where(bone => bone != null));
 
-                int boundaryBoneIndex = Array.IndexOf(bones, boundaryBone);
-                if (boundaryBoneIndex < 0)
-                    throw new InvalidOperationException(
-                        $"Boundary bone '{boundaryBone.name}' is not used by the source SkinnedMeshRenderer.");
-
-                var mask = new bool[bones.Length];
-                int descendantCount = 0;
-
-                for (int boneIndex = 0; boneIndex < bones.Length; boneIndex++)
+                for (int i = 0; i < rendererBones.Count; i++)
                 {
-                    Transform candidate = bones[boneIndex];
-                    if (candidate == null || candidate == boundaryBone)
-                        continue;
-
-                    if (candidate.IsChildOf(boundaryBone))
+                    Transform bone = rendererBones[i];
+                    if (bone != null && selectedSet.Contains(bone))
                     {
-                        mask[boneIndex] = true;
-                        descendantCount++;
+                        mask[i] = true;
+                        selectedBoneCount++;
                     }
                 }
 
-                if (descendantCount == 0)
+                foreach (Transform selected in selectedSet)
                 {
-                    skippedBoundaryCount++;
-                    continue;
-                }
+                    bool found = false;
+                    for (int i = 0; i < rendererBones.Count; i++)
+                    {
+                        if (rendererBones[i] == selected)
+                        {
+                            found = true;
+                            break;
+                        }
+                    }
 
-                result.Add(new BoneBoundary
+                    if (!found)
+                    {
+                        throw new InvalidOperationException(
+                            $"Selected bone '{selected.name}' is not used by the source renderer.");
+                    }
+                }
+            }
+
+            int selectableBoneCount = 0;
+            allRendererBonesSelected = true;
+
+            for (int i = 0; i < rendererBones.Count; i++)
+            {
+                if (rendererBones[i] == null)
+                    continue;
+
+                selectableBoneCount++;
+                if (!mask[i])
+                    allRendererBonesSelected = false;
+            }
+
+            if (selectableBoneCount == 0)
+                allRendererBonesSelected = false;
+
+            return mask;
+        }
+
+        private static List<SelectedBoneDiagnostic> BuildSelectedBoneDiagnostics(
+            IReadOnlyList<Transform> rendererBones,
+            IReadOnlyList<bool> selectedBoneMask,
+            IReadOnlyList<int> influencedVertexCountPerBone,
+            int sourceVertexCount)
+        {
+            var result = new List<SelectedBoneDiagnostic>();
+
+            for (int i = 0; i < rendererBones.Count; i++)
+            {
+                if (!selectedBoneMask[i])
+                    continue;
+
+                result.Add(new SelectedBoneDiagnostic
                 {
-                    Bone = boundaryBone,
-                    BoneIndex = boundaryBoneIndex,
-                    DescendantBoneCount = descendantCount,
-                    DistalBoneMask = mask
+                    BoneName = rendererBones[i] != null
+                        ? rendererBones[i].name
+                        : "<null>",
+                    BoneIndex = i,
+                    InfluencedVertexCount =
+                        i < influencedVertexCountPerBone.Count
+                            ? influencedVertexCountPerBone[i]
+                            : 0,
+                    SourceVertexCount = sourceVertexCount
                 });
             }
 
             return result;
         }
 
-        private static List<BoundaryDiagnostic> BuildBoundaryDiagnostics(
-            IReadOnlyList<BoneBoundary> boundaries,
-            IReadOnlyList<BoneWeight> sourceBoneWeights,
-            float distalThreshold)
+        private static int CountSelectedVertices(
+            IReadOnlyList<float> selectionWeights,
+            float selectionThreshold)
         {
-            var result = new List<BoundaryDiagnostic>(boundaries.Count);
+            int count = 0;
 
-            foreach (BoneBoundary boundary in boundaries)
+            for (int i = 0; i < selectionWeights.Count; i++)
             {
-                int distalVertexCount = 0;
-
-                for (int i = 0; i < sourceBoneWeights.Count; i++)
-                {
-                    if (boundary.DistalWeight(sourceBoneWeights[i]) > distalThreshold)
-                        distalVertexCount++;
-                }
-
-                result.Add(new BoundaryDiagnostic
-                {
-                    BoneName = boundary.Bone != null ? boundary.Bone.name : "<null>",
-                    BoneIndex = boundary.BoneIndex,
-                    DescendantBoneCount = boundary.DescendantBoneCount,
-                    DistalVertexCount = distalVertexCount,
-                    SourceVertexCount = sourceBoneWeights.Count
-                });
+                if (selectionWeights[i] >= selectionThreshold)
+                    count++;
             }
 
-            return result;
+            return count;
         }
 
-        private static void ClipGeometryByBoneBoundaries(
-            IReadOnlyList<Vector3> sourceVertices,
-            IReadOnlyList<Vector3> sourceNormals,
-            IReadOnlyList<Vector2> sourceUvs,
-            IReadOnlyList<BoneWeight> sourceBoneWeights,
-            IReadOnlyList<int> sourceTriangles,
-            IReadOnlyList<BoneBoundary> boundaries,
-            float distalThreshold,
-            out List<VertexData> vertices,
-            out List<int> triangles)
-        {
-            vertices = new List<VertexData>(sourceTriangles.Count);
-            triangles = new List<int>(sourceTriangles.Count);
-
-            for (int triangleIndex = 0; triangleIndex + 2 < sourceTriangles.Count; triangleIndex += 3)
-            {
-                var polygon = new List<VertexData>(3)
-                {
-                    MakeVertex(sourceTriangles[triangleIndex], sourceVertices, sourceNormals, sourceUvs, sourceBoneWeights),
-                    MakeVertex(sourceTriangles[triangleIndex + 1], sourceVertices, sourceNormals, sourceUvs, sourceBoneWeights),
-                    MakeVertex(sourceTriangles[triangleIndex + 2], sourceVertices, sourceNormals, sourceUvs, sourceBoneWeights)
-                };
-
-                for (int boundaryIndex = 0;
-                     boundaryIndex < boundaries.Count && polygon.Count >= 3;
-                     boundaryIndex++)
-                {
-                    polygon = ClipPolygonByBoundary(
-                        polygon,
-                        boundaries[boundaryIndex],
-                        distalThreshold);
-                }
-
-                if (polygon.Count < 3)
-                    continue;
-
-                int baseIndex = vertices.Count;
-                vertices.AddRange(polygon);
-
-                for (int i = 1; i + 1 < polygon.Count; i++)
-                {
-                    triangles.Add(baseIndex);
-                    triangles.Add(baseIndex + i);
-                    triangles.Add(baseIndex + i + 1);
-                }
-            }
-        }
-
-        private static VertexData MakeVertex(
-            int index,
-            IReadOnlyList<Vector3> positions,
-            IReadOnlyList<Vector3> normals,
-            IReadOnlyList<Vector2> uvs,
-            IReadOnlyList<BoneWeight> boneWeights)
-        {
-            return new VertexData
-            {
-                Position = positions[index],
-                Normal = normals[index],
-                Uv = uvs[index],
-                BoneWeight = boneWeights[index]
-            };
-        }
-
-        private static List<VertexData> ClipPolygonByBoundary(
-            IReadOnlyList<VertexData> input,
-            BoneBoundary boundary,
-            float distalThreshold)
-        {
-            var output = new List<VertexData>(input.Count + 1);
-            if (input.Count == 0)
-                return output;
-
-            VertexData previous = input[input.Count - 1];
-            float previousDistance = boundary.DistalWeight(previous.BoneWeight) - distalThreshold;
-            bool previousInside = previousDistance <= 1e-6f;
-
-            for (int i = 0; i < input.Count; i++)
-            {
-                VertexData current = input[i];
-                float currentDistance = boundary.DistalWeight(current.BoneWeight) - distalThreshold;
-                bool currentInside = currentDistance <= 1e-6f;
-
-                if (previousInside != currentInside)
-                {
-                    float denominator = previousDistance - currentDistance;
-                    float t = Mathf.Abs(denominator) > 1e-8f
-                        ? previousDistance / denominator
-                        : 0.5f;
-
-                    output.Add(Interpolate(previous, current, Mathf.Clamp01(t)));
-                }
-
-                if (currentInside)
-                    output.Add(current);
-
-                previous = current;
-                previousDistance = currentDistance;
-                previousInside = currentInside;
-            }
-
-            return output;
-        }
-
-        private static VertexData Interpolate(VertexData a, VertexData b, float t)
-        {
-            Vector3 normal = Vector3.Lerp(a.Normal, b.Normal, t);
-            normal = normal.sqrMagnitude > 1e-12f ? normal.normalized : Vector3.up;
-
-            return new VertexData
-            {
-                Position = Vector3.Lerp(a.Position, b.Position, t),
-                Normal = normal,
-                Uv = Vector2.Lerp(a.Uv, b.Uv, t),
-                BoneWeight = LerpBoneWeight(a.BoneWeight, b.BoneWeight, t)
-            };
-        }
-
-        private static Mesh BuildProxy(
-            Mesh sourceMesh,
-            IReadOnlyList<VertexData> sourceVertices,
-            IReadOnlyList<int> sourceTriangles,
-            float mergeSize,
-            float surfaceOffset)
-        {
-            float epsilonWeld = Mathf.Max(1e-7f, sourceMesh.bounds.size.magnitude * 1e-7f);
-            float cellSize = mergeSize > 1e-7f ? mergeSize : epsilonWeld;
-
-            var lookup = new Dictionary<GridKey, int>();
-            var clusters = new List<Cluster>();
-            var remap = new int[sourceVertices.Count];
-
-            for (int i = 0; i < sourceVertices.Count; i++)
-            {
-                GridKey key = new GridKey(sourceVertices[i].Position, cellSize);
-                if (!lookup.TryGetValue(key, out int clusterIndex))
-                {
-                    clusterIndex = clusters.Count;
-                    lookup.Add(key, clusterIndex);
-                    clusters.Add(new Cluster());
-                }
-
-                clusters[clusterIndex].Add(sourceVertices[i]);
-                remap[i] = clusterIndex;
-            }
-
-            var vertices = new List<Vector3>(clusters.Count);
-            var normals = new List<Vector3>(clusters.Count);
-            var uvs = new List<Vector2>(clusters.Count);
-            var weights = new List<BoneWeight>(clusters.Count);
-
-            foreach (Cluster cluster in clusters)
-            {
-                float invCount = 1f / Mathf.Max(1, cluster.Count);
-                Vector3 normal = cluster.NormalSum.sqrMagnitude > 1e-12f
-                    ? cluster.NormalSum.normalized
-                    : Vector3.up;
-
-                vertices.Add(cluster.PositionSum * invCount + normal * surfaceOffset);
-                normals.Add(normal);
-                uvs.Add(cluster.UvSum * invCount);
-                weights.Add(BuildBoneWeight(cluster.BoneWeights));
-            }
-
-            var triangles = new List<int>(sourceTriangles.Count);
-            var seen = new HashSet<TriangleKey>();
-
-            for (int i = 0; i + 2 < sourceTriangles.Count; i += 3)
-            {
-                int a = remap[sourceTriangles[i]];
-                int b = remap[sourceTriangles[i + 1]];
-                int c = remap[sourceTriangles[i + 2]];
-
-                if (a == b || b == c || c == a)
-                    continue;
-
-                Vector3 cross = Vector3.Cross(vertices[b] - vertices[a], vertices[c] - vertices[a]);
-                if (cross.sqrMagnitude < 1e-12f)
-                    continue;
-
-                if (!seen.Add(new TriangleKey(a, b, c)))
-                    continue;
-
-                triangles.Add(a);
-                triangles.Add(b);
-                triangles.Add(c);
-            }
-
-            if (triangles.Count == 0)
-                throw new InvalidOperationException(
-                    "Proxy generation produced no triangles. Set Merge Size to 0 or remove an incorrect boundary bone.");
-
-            var mesh = new Mesh
-            {
-                name = sourceMesh.name + ProxySuffix,
-                indexFormat = vertices.Count > 65535 ? IndexFormat.UInt32 : IndexFormat.UInt16
-            };
-
-            mesh.SetVertices(vertices);
-            mesh.SetNormals(normals);
-            mesh.SetUVs(0, uvs);
-            mesh.boneWeights = weights.ToArray();
-            mesh.bindposes = sourceMesh.bindposes;
-            mesh.SetTriangles(triangles, 0, true);
-            mesh.RecalculateBounds();
-
-            return mesh;
-        }
-
-        private static Dictionary<EdgeKey, EdgeInfo> BuildEdgeTable(IReadOnlyList<int> triangles)
-        {
-            var edges = new Dictionary<EdgeKey, EdgeInfo>();
-
-            for (int i = 0; i + 2 < triangles.Count; i += 3)
-            {
-                AddEdge(edges, triangles[i], triangles[i + 1]);
-                AddEdge(edges, triangles[i + 1], triangles[i + 2]);
-                AddEdge(edges, triangles[i + 2], triangles[i]);
-            }
-
-            return edges;
-        }
-
-        private static void AddEdge(
-            Dictionary<EdgeKey, EdgeInfo> edges,
-            int from,
-            int to)
-        {
-            EdgeKey key = new EdgeKey(from, to);
-            if (edges.TryGetValue(key, out EdgeInfo info))
-            {
-                info.Count++;
-            }
-            else
-            {
-                edges.Add(key, new EdgeInfo
-                {
-                    Count = 1,
-                    From = from,
-                    To = to
-                });
-            }
-        }
-
-        private static void SealOpenBoundaries(Mesh mesh)
-        {
-            var vertices = mesh.vertices.ToList();
-            var normals = mesh.normals.ToList();
-            var uvs = mesh.uv != null && mesh.uv.Length == mesh.vertexCount
-                ? mesh.uv.ToList()
-                : Enumerable.Repeat(Vector2.zero, mesh.vertexCount).ToList();
-            var weights = mesh.boneWeights.ToList();
-            var triangles = mesh.triangles.ToList();
-
-            Dictionary<EdgeKey, EdgeInfo> edgeTable = BuildEdgeTable(triangles);
-            List<EdgeInfo> boundary = edgeTable.Values
-                .Where(edge => edge.Count == 1)
-                .ToList();
-
-            if (boundary.Count == 0)
-                return;
-
-            var adjacency = new Dictionary<int, List<EdgeInfo>>();
-            foreach (EdgeInfo edge in boundary)
-            {
-                AddAdjacency(adjacency, edge.From, edge);
-                AddAdjacency(adjacency, edge.To, edge);
-            }
-
-            var used = new HashSet<EdgeKey>();
-
-            foreach (EdgeInfo first in boundary)
-            {
-                EdgeKey firstKey = new EdgeKey(first.From, first.To);
-                if (used.Contains(firstKey))
-                    continue;
-
-                var loop = new List<int> { first.From, first.To };
-                used.Add(firstKey);
-
-                int start = first.From;
-                int previous = first.From;
-                int current = first.To;
-                bool closed = false;
-
-                for (int guard = 0; guard < boundary.Count + 2; guard++)
-                {
-                    if (!adjacency.TryGetValue(current, out List<EdgeInfo> connected))
-                        break;
-
-                    EdgeInfo nextEdge = null;
-                    int nextVertex = -1;
-
-                    foreach (EdgeInfo candidate in connected)
-                    {
-                        EdgeKey candidateKey = new EdgeKey(candidate.From, candidate.To);
-                        if (used.Contains(candidateKey))
-                            continue;
-
-                        int candidateNext = candidate.From == current
-                            ? candidate.To
-                            : candidate.From;
-
-                        if (candidateNext == previous && connected.Count > 1)
-                            continue;
-
-                        nextEdge = candidate;
-                        nextVertex = candidateNext;
-                        break;
-                    }
-
-                    if (nextEdge == null)
-                        break;
-
-                    used.Add(new EdgeKey(nextEdge.From, nextEdge.To));
-
-                    if (nextVertex == start)
-                    {
-                        closed = true;
-                        break;
-                    }
-
-                    loop.Add(nextVertex);
-                    previous = current;
-                    current = nextVertex;
-                }
-
-                if (!closed || loop.Count < 3)
-                    continue;
-
-                Vector3 center = Vector3.zero;
-                Vector2 uvCenter = Vector2.zero;
-                var accumulatedWeights = new Dictionary<int, float>();
-
-                foreach (int index in loop)
-                {
-                    center += vertices[index];
-                    uvCenter += uvs[index];
-                    AccumulateBoneWeight(
-                        accumulatedWeights,
-                        weights[index],
-                        1f / loop.Count);
-                }
-
-                center /= loop.Count;
-                uvCenter /= loop.Count;
-
-                Vector3 loopNormal = Vector3.zero;
-                for (int i = 0; i < loop.Count; i++)
-                {
-                    Vector3 a = vertices[loop[i]] - center;
-                    Vector3 b = vertices[loop[(i + 1) % loop.Count]] - center;
-                    loopNormal += Vector3.Cross(a, b);
-                }
-
-                Vector3 capNormal = loopNormal.sqrMagnitude > 1e-12f
-                    ? -loopNormal.normalized
-                    : Vector3.up;
-
-                int centerIndex = vertices.Count;
-                vertices.Add(center);
-                normals.Add(capNormal);
-                uvs.Add(uvCenter);
-                weights.Add(BuildBoneWeight(accumulatedWeights));
-
-                for (int i = 0; i < loop.Count; i++)
-                {
-                    int currentIndex = loop[i];
-                    int nextIndex = loop[(i + 1) % loop.Count];
-
-                    triangles.Add(nextIndex);
-                    triangles.Add(currentIndex);
-                    triangles.Add(centerIndex);
-                }
-            }
-
-            mesh.indexFormat = vertices.Count > 65535
-                ? IndexFormat.UInt32
-                : IndexFormat.UInt16;
-            mesh.SetVertices(vertices);
-            mesh.SetNormals(normals);
-            mesh.SetUVs(0, uvs);
-            mesh.boneWeights = weights.ToArray();
-            mesh.SetTriangles(triangles, 0, true);
-            mesh.RecalculateBounds();
-        }
-
-        private static void AddAdjacency(
-            Dictionary<int, List<EdgeInfo>> adjacency,
-            int vertex,
-            EdgeInfo edge)
-        {
-            if (!adjacency.TryGetValue(vertex, out List<EdgeInfo> list))
-            {
-                list = new List<EdgeInfo>();
-                adjacency.Add(vertex, list);
-            }
-
-            list.Add(edge);
-        }
-
-        private static BoneWeight LerpBoneWeight(
-            BoneWeight a,
-            BoneWeight b,
-            float t)
-        {
-            var accumulated = new Dictionary<int, float>();
-            AccumulateBoneWeight(accumulated, a, 1f - t);
-            AccumulateBoneWeight(accumulated, b, t);
-            return BuildBoneWeight(accumulated);
-        }
-
-        private static void AccumulateBoneWeight(
-            Dictionary<int, float> target,
-            BoneWeight weight,
-            float multiplier)
-        {
-            AddInfluence(target, weight.boneIndex0, weight.weight0 * multiplier);
-            AddInfluence(target, weight.boneIndex1, weight.weight1 * multiplier);
-            AddInfluence(target, weight.boneIndex2, weight.weight2 * multiplier);
-            AddInfluence(target, weight.boneIndex3, weight.weight3 * multiplier);
-        }
-
-        private static void AddInfluence(
-            Dictionary<int, float> target,
-            int boneIndex,
-            float weight)
-        {
-            if (weight <= 0f)
-                return;
-
-            if (target.TryGetValue(boneIndex, out float current))
-                target[boneIndex] = current + weight;
-            else
-                target.Add(boneIndex, weight);
-        }
-
-        private static BoneWeight BuildBoneWeight(
-            Dictionary<int, float> accumulated)
-        {
-            if (accumulated == null || accumulated.Count == 0)
-                return new BoneWeight { boneIndex0 = 0, weight0 = 1f };
-
-            KeyValuePair<int, float>[] top = accumulated
-                .Where(pair => pair.Value > 0f)
-                .OrderByDescending(pair => pair.Value)
-                .Take(4)
-                .ToArray();
-
-            float total = top.Sum(pair => pair.Value);
-            if (total <= 1e-8f)
-                return new BoneWeight { boneIndex0 = 0, weight0 = 1f };
-
-            BoneWeight result = default;
-
-            for (int i = 0; i < top.Length; i++)
-            {
-                float normalized = top[i].Value / total;
-
-                switch (i)
-                {
-                    case 0:
-                        result.boneIndex0 = top[i].Key;
-                        result.weight0 = normalized;
-                        break;
-                    case 1:
-                        result.boneIndex1 = top[i].Key;
-                        result.weight1 = normalized;
-                        break;
-                    case 2:
-                        result.boneIndex2 = top[i].Key;
-                        result.weight2 = normalized;
-                        break;
-                    case 3:
-                        result.boneIndex3 = top[i].Key;
-                        result.weight3 = normalized;
-                        break;
-                }
-            }
-
-            return result;
-        }
-
-        private static void ReadSourceMesh(
+        private static void ReadSourceGeometry(
             Mesh mesh,
-            Transform[] bones,
             out Vector3[] vertices,
             out Vector3[] normals,
             out Vector2[] uvs,
-            out BoneWeight[] boneWeights,
             out List<int> triangles)
         {
             using (Mesh.MeshDataArray dataArray = MeshUtility.AcquireReadOnlyMeshData(mesh))
@@ -977,36 +582,125 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             if (normals == null || normals.Length != vertices.Length)
                 normals = CalculateNormals(vertices, triangles);
+        }
 
-            var weights = new List<BoneWeight>(vertices.Length);
+        private static void ReadSourceSkinning(
+            Mesh mesh,
+            int rendererBoneCount,
+            IReadOnlyList<bool> selectedBoneMask,
+            out BoneWeight[] fourWeights,
+            out float[] selectionWeights,
+            out int[] influencedVertexCountPerBone)
+        {
+            NativeArray<byte> bonesPerVertex = mesh.GetBonesPerVertex();
+            NativeArray<BoneWeight1> allWeights = mesh.GetAllBoneWeights();
 
-            try
-            {
-                mesh.GetBoneWeights(weights);
-            }
-            catch (Exception ex)
+            if (bonesPerVertex.Length != mesh.vertexCount)
             {
                 throw new InvalidOperationException(
-                    "Failed to read source bone weights. Try enabling Read/Write on the source model importer.",
-                    ex);
+                    "Source mesh bone-weight count does not match vertex count.");
             }
 
-            if (weights.Count == vertices.Length)
-            {
-                boneWeights = weights.ToArray();
-            }
-            else
-            {
-                boneWeights = new BoneWeight[vertices.Length];
+            fourWeights = new BoneWeight[mesh.vertexCount];
+            selectionWeights = new float[mesh.vertexCount];
+            influencedVertexCountPerBone = new int[rendererBoneCount];
 
-                for (int i = 0; i < boneWeights.Length; i++)
+            int cursor = 0;
+
+            for (int vertexIndex = 0; vertexIndex < mesh.vertexCount; vertexIndex++)
+            {
+                int influenceCount = bonesPerVertex[vertexIndex];
+                float selectedWeight = 0f;
+
+                int b0 = 0;
+                int b1 = 0;
+                int b2 = 0;
+                int b3 = 0;
+                float w0 = 0f;
+                float w1 = 0f;
+                float w2 = 0f;
+                float w3 = 0f;
+                float topFourTotal = 0f;
+
+                for (int influenceIndex = 0; influenceIndex < influenceCount; influenceIndex++)
                 {
-                    boneWeights[i] = new BoneWeight
+                    if (cursor >= allWeights.Length)
                     {
-                        boneIndex0 = 0,
-                        weight0 = bones != null && bones.Length > 0 ? 1f : 0f
-                    };
+                        throw new InvalidOperationException(
+                            "Source mesh bone-weight stream ended unexpectedly.");
+                    }
+
+                    BoneWeight1 influence = allWeights[cursor++];
+                    int boneIndex = influence.boneIndex;
+                    float weight = influence.weight;
+
+                    if (boneIndex < 0 || boneIndex >= rendererBoneCount)
+                    {
+                        throw new InvalidOperationException(
+                            $"Source mesh references bone index {boneIndex}, " +
+                            $"but renderer has only {rendererBoneCount} bones.");
+                    }
+
+                    if (weight > 0f)
+                        influencedVertexCountPerBone[boneIndex]++;
+
+                    if (selectedBoneMask[boneIndex])
+                        selectedWeight += weight;
+
+                    if (influenceIndex < 4)
+                    {
+                        switch (influenceIndex)
+                        {
+                            case 0:
+                                b0 = boneIndex;
+                                w0 = weight;
+                                break;
+                            case 1:
+                                b1 = boneIndex;
+                                w1 = weight;
+                                break;
+                            case 2:
+                                b2 = boneIndex;
+                                w2 = weight;
+                                break;
+                            case 3:
+                                b3 = boneIndex;
+                                w3 = weight;
+                                break;
+                        }
+
+                        topFourTotal += weight;
+                    }
                 }
+
+                if (influenceCount == 0 || topFourTotal <= 1e-8f)
+                {
+                    throw new InvalidOperationException(
+                        $"Source mesh vertex {vertexIndex} has no usable bone weights.");
+                }
+
+                float inv = 1f / topFourTotal;
+
+                fourWeights[vertexIndex] = new BoneWeight
+                {
+                    boneIndex0 = b0,
+                    boneIndex1 = b1,
+                    boneIndex2 = b2,
+                    boneIndex3 = b3,
+                    weight0 = w0 * inv,
+                    weight1 = w1 * inv,
+                    weight2 = w2 * inv,
+                    weight3 = w3 * inv
+                };
+
+                selectionWeights[vertexIndex] = Mathf.Clamp01(selectedWeight);
+            }
+
+            if (cursor != allWeights.Length)
+            {
+                throw new InvalidOperationException(
+                    "Source mesh bone-weight stream contains unused entries. " +
+                    "The skinning data is inconsistent.");
             }
         }
 
@@ -1025,7 +719,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         continue;
 
                     for (int i = 0; i < subMesh.indexCount; i++)
-                        result.Add(indices[subMesh.indexStart + i] + subMesh.baseVertex);
+                    {
+                        result.Add(
+                            indices[subMesh.indexStart + i] +
+                            subMesh.baseVertex);
+                    }
                 }
             }
             else
@@ -1039,7 +737,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         continue;
 
                     for (int i = 0; i < subMesh.indexCount; i++)
-                        result.Add((int)indices[subMesh.indexStart + i] + subMesh.baseVertex);
+                    {
+                        result.Add(
+                            (int)indices[subMesh.indexStart + i] +
+                            subMesh.baseVertex);
+                    }
                 }
             }
 
@@ -1049,32 +751,670 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             return result;
         }
 
+        private static void ExtractSelectedGeometry(
+            IReadOnlyList<Vector3> sourceVertices,
+            IReadOnlyList<Vector3> sourceNormals,
+            IReadOnlyList<Vector2> sourceUvs,
+            IReadOnlyList<BoneWeight> sourceBoneWeights,
+            IReadOnlyList<float> sourceSelectionWeights,
+            IReadOnlyList<int> sourceTriangles,
+            float selectionThreshold,
+            bool bypassSelection,
+            out List<VertexData> vertices,
+            out List<int> triangles)
+        {
+            vertices = new List<VertexData>(sourceTriangles.Count);
+            triangles = new List<int>(sourceTriangles.Count);
+
+            for (int triangleIndex = 0;
+                 triangleIndex + 2 < sourceTriangles.Count;
+                 triangleIndex += 3)
+            {
+                var polygon = new List<VertexData>(3)
+                {
+                    MakeVertex(
+                        sourceTriangles[triangleIndex],
+                        sourceVertices,
+                        sourceNormals,
+                        sourceUvs,
+                        sourceBoneWeights,
+                        sourceSelectionWeights),
+                    MakeVertex(
+                        sourceTriangles[triangleIndex + 1],
+                        sourceVertices,
+                        sourceNormals,
+                        sourceUvs,
+                        sourceBoneWeights,
+                        sourceSelectionWeights),
+                    MakeVertex(
+                        sourceTriangles[triangleIndex + 2],
+                        sourceVertices,
+                        sourceNormals,
+                        sourceUvs,
+                        sourceBoneWeights,
+                        sourceSelectionWeights)
+                };
+
+                if (!bypassSelection)
+                    polygon = ClipPolygonBySelectionWeight(polygon, selectionThreshold);
+
+                if (polygon.Count < 3)
+                    continue;
+
+                int baseIndex = vertices.Count;
+                vertices.AddRange(polygon);
+
+                for (int i = 1; i + 1 < polygon.Count; i++)
+                {
+                    triangles.Add(baseIndex);
+                    triangles.Add(baseIndex + i);
+                    triangles.Add(baseIndex + i + 1);
+                }
+            }
+        }
+
+        private static VertexData MakeVertex(
+            int index,
+            IReadOnlyList<Vector3> positions,
+            IReadOnlyList<Vector3> normals,
+            IReadOnlyList<Vector2> uvs,
+            IReadOnlyList<BoneWeight> boneWeights,
+            IReadOnlyList<float> selectionWeights)
+        {
+            return new VertexData
+            {
+                Position = positions[index],
+                Normal = normals[index],
+                Uv = uvs[index],
+                BoneWeight = boneWeights[index],
+                SelectionWeight = selectionWeights[index]
+            };
+        }
+
+        private static List<VertexData> ClipPolygonBySelectionWeight(
+            IReadOnlyList<VertexData> input,
+            float threshold)
+        {
+            var output = new List<VertexData>(input.Count + 1);
+            if (input.Count == 0)
+                return output;
+
+            VertexData previous = input[input.Count - 1];
+            float previousDistance = previous.SelectionWeight - threshold;
+            bool previousInside = previousDistance >= -1e-6f;
+
+            for (int i = 0; i < input.Count; i++)
+            {
+                VertexData current = input[i];
+                float currentDistance = current.SelectionWeight - threshold;
+                bool currentInside = currentDistance >= -1e-6f;
+
+                if (previousInside != currentInside)
+                {
+                    float denominator = previousDistance - currentDistance;
+                    float t = Mathf.Abs(denominator) > 1e-8f
+                        ? previousDistance / denominator
+                        : 0.5f;
+
+                    output.Add(
+                        Interpolate(
+                            previous,
+                            current,
+                            Mathf.Clamp01(t)));
+                }
+
+                if (currentInside)
+                    output.Add(current);
+
+                previous = current;
+                previousDistance = currentDistance;
+                previousInside = currentInside;
+            }
+
+            return output;
+        }
+
+        private static VertexData Interpolate(
+            VertexData a,
+            VertexData b,
+            float t)
+        {
+            Vector3 normal = Vector3.Lerp(a.Normal, b.Normal, t);
+            normal = normal.sqrMagnitude > 1e-12f
+                ? normal.normalized
+                : Vector3.up;
+
+            return new VertexData
+            {
+                Position = Vector3.Lerp(a.Position, b.Position, t),
+                Normal = normal,
+                Uv = Vector2.Lerp(a.Uv, b.Uv, t),
+                BoneWeight = LerpBoneWeight(a.BoneWeight, b.BoneWeight, t),
+                SelectionWeight = Mathf.Lerp(a.SelectionWeight, b.SelectionWeight, t)
+            };
+        }
+
+        private static Mesh BuildProxy(
+            Mesh sourceMesh,
+            IReadOnlyList<VertexData> sourceVertices,
+            IReadOnlyList<int> sourceTriangles,
+            float mergeSize,
+            float surfaceOffset)
+        {
+            float epsilonWeld =
+                Mathf.Max(
+                    1e-7f,
+                    sourceMesh.bounds.size.magnitude * 1e-7f);
+
+            float cellSize =
+                mergeSize > 1e-7f
+                    ? mergeSize
+                    : epsilonWeld;
+
+            var lookup = new Dictionary<GridKey, int>();
+            var clusters = new List<Cluster>();
+            var remap = new int[sourceVertices.Count];
+
+            for (int i = 0; i < sourceVertices.Count; i++)
+            {
+                GridKey key = new GridKey(
+                    sourceVertices[i].Position,
+                    cellSize);
+
+                if (!lookup.TryGetValue(key, out int clusterIndex))
+                {
+                    clusterIndex = clusters.Count;
+                    lookup.Add(key, clusterIndex);
+                    clusters.Add(new Cluster());
+                }
+
+                clusters[clusterIndex].Add(sourceVertices[i]);
+                remap[i] = clusterIndex;
+            }
+
+            var vertices = new List<Vector3>(clusters.Count);
+            var normals = new List<Vector3>(clusters.Count);
+            var uvs = new List<Vector2>(clusters.Count);
+            var weights = new List<BoneWeight>(clusters.Count);
+
+            foreach (Cluster cluster in clusters)
+            {
+                float invCount = 1f / Mathf.Max(1, cluster.Count);
+
+                Vector3 normal =
+                    cluster.NormalSum.sqrMagnitude > 1e-12f
+                        ? cluster.NormalSum.normalized
+                        : Vector3.up;
+
+                vertices.Add(
+                    cluster.PositionSum * invCount +
+                    normal * surfaceOffset);
+
+                normals.Add(normal);
+                uvs.Add(cluster.UvSum * invCount);
+                weights.Add(BuildBoneWeight(cluster.BoneWeights));
+            }
+
+            var triangles = new List<int>(sourceTriangles.Count);
+            var seen = new HashSet<TriangleKey>();
+
+            for (int i = 0; i + 2 < sourceTriangles.Count; i += 3)
+            {
+                int a = remap[sourceTriangles[i]];
+                int b = remap[sourceTriangles[i + 1]];
+                int c = remap[sourceTriangles[i + 2]];
+
+                if (a == b || b == c || c == a)
+                    continue;
+
+                Vector3 cross =
+                    Vector3.Cross(
+                        vertices[b] - vertices[a],
+                        vertices[c] - vertices[a]);
+
+                if (cross.sqrMagnitude < 1e-12f)
+                    continue;
+
+                if (!seen.Add(new TriangleKey(a, b, c)))
+                    continue;
+
+                triangles.Add(a);
+                triangles.Add(b);
+                triangles.Add(c);
+            }
+
+            if (triangles.Count == 0)
+            {
+                throw new InvalidOperationException(
+                    "Proxy generation produced no triangles. " +
+                    "Set Merge Size to 0 or broaden the bone selection.");
+            }
+
+            var mesh = new Mesh
+            {
+                name = sourceMesh.name + ProxySuffix,
+                indexFormat =
+                    vertices.Count > 65535
+                        ? IndexFormat.UInt32
+                        : IndexFormat.UInt16
+            };
+
+            mesh.SetVertices(vertices);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            mesh.boneWeights = weights.ToArray();
+            mesh.bindposes = sourceMesh.bindposes;
+            mesh.SetTriangles(triangles, 0, true);
+            mesh.RecalculateBounds();
+
+            return mesh;
+        }
+
+        private static Dictionary<EdgeKey, EdgeInfo> BuildEdgeTable(
+            IReadOnlyList<int> triangles)
+        {
+            var edges = new Dictionary<EdgeKey, EdgeInfo>();
+
+            for (int i = 0; i + 2 < triangles.Count; i += 3)
+            {
+                AddEdge(edges, triangles[i], triangles[i + 1]);
+                AddEdge(edges, triangles[i + 1], triangles[i + 2]);
+                AddEdge(edges, triangles[i + 2], triangles[i]);
+            }
+
+            return edges;
+        }
+
+        private static void AddEdge(
+            Dictionary<EdgeKey, EdgeInfo> edges,
+            int from,
+            int to)
+        {
+            EdgeKey key = new EdgeKey(from, to);
+
+            if (edges.TryGetValue(key, out EdgeInfo info))
+            {
+                info.Count++;
+            }
+            else
+            {
+                edges.Add(
+                    key,
+                    new EdgeInfo
+                    {
+                        Count = 1,
+                        From = from,
+                        To = to
+                    });
+            }
+        }
+
+        private static void SealOpenBoundaries(Mesh mesh)
+        {
+            var vertices = mesh.vertices.ToList();
+            var normals = mesh.normals.ToList();
+
+            var uvs =
+                mesh.uv != null && mesh.uv.Length == mesh.vertexCount
+                    ? mesh.uv.ToList()
+                    : Enumerable.Repeat(Vector2.zero, mesh.vertexCount).ToList();
+
+            var weights = mesh.boneWeights.ToList();
+            var triangles = mesh.triangles.ToList();
+
+            Dictionary<EdgeKey, EdgeInfo> edgeTable = BuildEdgeTable(triangles);
+
+            List<EdgeInfo> boundary =
+                edgeTable.Values
+                    .Where(edge => edge.Count == 1)
+                    .ToList();
+
+            if (boundary.Count == 0)
+                return;
+
+            var adjacency = new Dictionary<int, List<EdgeInfo>>();
+
+            foreach (EdgeInfo edge in boundary)
+            {
+                AddAdjacency(adjacency, edge.From, edge);
+                AddAdjacency(adjacency, edge.To, edge);
+            }
+
+            var used = new HashSet<EdgeKey>();
+
+            foreach (EdgeInfo first in boundary)
+            {
+                EdgeKey firstKey = new EdgeKey(first.From, first.To);
+                if (used.Contains(firstKey))
+                    continue;
+
+                var loop = new List<int>
+                {
+                    first.From,
+                    first.To
+                };
+
+                used.Add(firstKey);
+
+                int start = first.From;
+                int previous = first.From;
+                int current = first.To;
+                bool closed = false;
+
+                for (int guard = 0;
+                     guard < boundary.Count + 2;
+                     guard++)
+                {
+                    if (!adjacency.TryGetValue(
+                        current,
+                        out List<EdgeInfo> connected))
+                    {
+                        break;
+                    }
+
+                    EdgeInfo nextEdge = null;
+                    int nextVertex = -1;
+
+                    foreach (EdgeInfo candidate in connected)
+                    {
+                        EdgeKey candidateKey =
+                            new EdgeKey(candidate.From, candidate.To);
+
+                        if (used.Contains(candidateKey))
+                            continue;
+
+                        int candidateNext =
+                            candidate.From == current
+                                ? candidate.To
+                                : candidate.From;
+
+                        if (candidateNext == previous &&
+                            connected.Count > 1)
+                        {
+                            continue;
+                        }
+
+                        nextEdge = candidate;
+                        nextVertex = candidateNext;
+                        break;
+                    }
+
+                    if (nextEdge == null)
+                        break;
+
+                    used.Add(
+                        new EdgeKey(
+                            nextEdge.From,
+                            nextEdge.To));
+
+                    if (nextVertex == start)
+                    {
+                        closed = true;
+                        break;
+                    }
+
+                    loop.Add(nextVertex);
+                    previous = current;
+                    current = nextVertex;
+                }
+
+                if (!closed || loop.Count < 3)
+                    continue;
+
+                Vector3 center = Vector3.zero;
+                Vector2 uvCenter = Vector2.zero;
+                var accumulatedWeights =
+                    new Dictionary<int, float>();
+
+                foreach (int index in loop)
+                {
+                    center += vertices[index];
+                    uvCenter += uvs[index];
+
+                    AccumulateBoneWeight(
+                        accumulatedWeights,
+                        weights[index],
+                        1f / loop.Count);
+                }
+
+                center /= loop.Count;
+                uvCenter /= loop.Count;
+
+                Vector3 loopNormal = Vector3.zero;
+
+                for (int i = 0; i < loop.Count; i++)
+                {
+                    Vector3 a =
+                        vertices[loop[i]] -
+                        center;
+
+                    Vector3 b =
+                        vertices[loop[(i + 1) % loop.Count]] -
+                        center;
+
+                    loopNormal += Vector3.Cross(a, b);
+                }
+
+                Vector3 capNormal =
+                    loopNormal.sqrMagnitude > 1e-12f
+                        ? -loopNormal.normalized
+                        : Vector3.up;
+
+                int centerIndex = vertices.Count;
+
+                vertices.Add(center);
+                normals.Add(capNormal);
+                uvs.Add(uvCenter);
+                weights.Add(
+                    BuildBoneWeight(accumulatedWeights));
+
+                for (int i = 0; i < loop.Count; i++)
+                {
+                    int currentIndex = loop[i];
+                    int nextIndex =
+                        loop[(i + 1) % loop.Count];
+
+                    triangles.Add(nextIndex);
+                    triangles.Add(currentIndex);
+                    triangles.Add(centerIndex);
+                }
+            }
+
+            mesh.indexFormat =
+                vertices.Count > 65535
+                    ? IndexFormat.UInt32
+                    : IndexFormat.UInt16;
+
+            mesh.SetVertices(vertices);
+            mesh.SetNormals(normals);
+            mesh.SetUVs(0, uvs);
+            mesh.boneWeights = weights.ToArray();
+            mesh.SetTriangles(triangles, 0, true);
+            mesh.RecalculateBounds();
+        }
+
+        private static void AddAdjacency(
+            Dictionary<int, List<EdgeInfo>> adjacency,
+            int vertex,
+            EdgeInfo edge)
+        {
+            if (!adjacency.TryGetValue(
+                vertex,
+                out List<EdgeInfo> list))
+            {
+                list = new List<EdgeInfo>();
+                adjacency.Add(vertex, list);
+            }
+
+            list.Add(edge);
+        }
+
+        private static BoneWeight LerpBoneWeight(
+            BoneWeight a,
+            BoneWeight b,
+            float t)
+        {
+            var accumulated =
+                new Dictionary<int, float>();
+
+            AccumulateBoneWeight(
+                accumulated,
+                a,
+                1f - t);
+
+            AccumulateBoneWeight(
+                accumulated,
+                b,
+                t);
+
+            return BuildBoneWeight(accumulated);
+        }
+
+        private static void AccumulateBoneWeight(
+            Dictionary<int, float> target,
+            BoneWeight weight,
+            float multiplier)
+        {
+            AddInfluence(
+                target,
+                weight.boneIndex0,
+                weight.weight0 * multiplier);
+
+            AddInfluence(
+                target,
+                weight.boneIndex1,
+                weight.weight1 * multiplier);
+
+            AddInfluence(
+                target,
+                weight.boneIndex2,
+                weight.weight2 * multiplier);
+
+            AddInfluence(
+                target,
+                weight.boneIndex3,
+                weight.weight3 * multiplier);
+        }
+
+        private static void AddInfluence(
+            Dictionary<int, float> target,
+            int boneIndex,
+            float weight)
+        {
+            if (weight <= 0f)
+                return;
+
+            if (target.TryGetValue(
+                boneIndex,
+                out float current))
+            {
+                target[boneIndex] =
+                    current + weight;
+            }
+            else
+            {
+                target.Add(
+                    boneIndex,
+                    weight);
+            }
+        }
+
+        private static BoneWeight BuildBoneWeight(
+            Dictionary<int, float> accumulated)
+        {
+            if (accumulated == null ||
+                accumulated.Count == 0)
+            {
+                return new BoneWeight
+                {
+                    boneIndex0 = 0,
+                    weight0 = 1f
+                };
+            }
+
+            KeyValuePair<int, float>[] top =
+                accumulated
+                    .Where(pair => pair.Value > 0f)
+                    .OrderByDescending(pair => pair.Value)
+                    .Take(4)
+                    .ToArray();
+
+            float total =
+                top.Sum(pair => pair.Value);
+
+            if (total <= 1e-8f)
+            {
+                return new BoneWeight
+                {
+                    boneIndex0 = 0,
+                    weight0 = 1f
+                };
+            }
+
+            BoneWeight result = default;
+
+            for (int i = 0; i < top.Length; i++)
+            {
+                float normalized =
+                    top[i].Value / total;
+
+                switch (i)
+                {
+                    case 0:
+                        result.boneIndex0 = top[i].Key;
+                        result.weight0 = normalized;
+                        break;
+                    case 1:
+                        result.boneIndex1 = top[i].Key;
+                        result.weight1 = normalized;
+                        break;
+                    case 2:
+                        result.boneIndex2 = top[i].Key;
+                        result.weight2 = normalized;
+                        break;
+                    case 3:
+                        result.boneIndex3 = top[i].Key;
+                        result.weight3 = normalized;
+                        break;
+                }
+            }
+
+            return result;
+        }
+
         private static Vector3[] CalculateNormals(
             IReadOnlyList<Vector3> vertices,
             IReadOnlyList<int> triangles)
         {
-            var result = new Vector3[vertices.Count];
+            var result =
+                new Vector3[vertices.Count];
 
-            for (int i = 0; i + 2 < triangles.Count; i += 3)
+            for (int i = 0;
+                 i + 2 < triangles.Count;
+                 i += 3)
             {
                 int a = triangles[i];
                 int b = triangles[i + 1];
                 int c = triangles[i + 2];
 
-                Vector3 normal = Vector3.Cross(
-                    vertices[b] - vertices[a],
-                    vertices[c] - vertices[a]);
+                Vector3 normal =
+                    Vector3.Cross(
+                        vertices[b] - vertices[a],
+                        vertices[c] - vertices[a]);
 
                 result[a] += normal;
                 result[b] += normal;
                 result[c] += normal;
             }
 
-            for (int i = 0; i < result.Length; i++)
+            for (int i = 0;
+                 i < result.Length;
+                 i++)
             {
-                result[i] = result[i].sqrMagnitude > 1e-12f
-                    ? result[i].normalized
-                    : Vector3.up;
+                result[i] =
+                    result[i].sqrMagnitude > 1e-12f
+                        ? result[i].normalized
+                        : Vector3.up;
             }
 
             return result;
@@ -1087,75 +1427,122 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             float fadeStrength,
             float coreStrength)
         {
-            Material existing = AssetDatabase.LoadAssetAtPath<Material>(path);
-            if (existing != null && !replaceExisting)
+            Material existing =
+                AssetDatabase.LoadAssetAtPath<Material>(path);
+
+            if (existing != null &&
+                !replaceExisting)
+            {
                 return existing;
+            }
 
             if (existing != null)
                 AssetDatabase.DeleteAsset(path);
 
-            Shader shader = Shader.Find(ShaderName);
+            Shader shader =
+                Shader.Find(ShaderName);
+
             if (shader == null)
                 shader = Shader.Find("Unlit/Color");
+
             if (shader == null)
+            {
                 throw new InvalidOperationException(
                     "NearShaderProxyVolume shader was not found and no fallback shader is available.");
+            }
 
-            var material = new Material(shader)
-            {
-                name = Path.GetFileNameWithoutExtension(path)
-            };
+            var material =
+                new Material(shader)
+                {
+                    name =
+                        Path.GetFileNameWithoutExtension(path)
+                };
 
             if (material.HasProperty("_Color"))
                 material.SetColor("_Color", Color.black);
+
             if (material.HasProperty("_FadeDistance"))
                 material.SetFloat("_FadeDistance", fadeDistance);
+
             if (material.HasProperty("_FadeStrength"))
                 material.SetFloat("_FadeStrength", fadeStrength);
+
             if (material.HasProperty("_CoreStrength"))
                 material.SetFloat("_CoreStrength", coreStrength);
 
             if (shader.name == "Unlit/Color")
                 material.color = Color.black;
 
-            AssetDatabase.CreateAsset(material, path);
+            AssetDatabase.CreateAsset(
+                material,
+                path);
+
             return material;
         }
 
-        private static Bounds ExpandBounds(Bounds source, float margin)
+        private static Bounds ExpandBounds(
+            Bounds source,
+            float margin)
         {
-            source.Expand(Mathf.Max(0f, margin) * 2f);
+            source.Expand(
+                Mathf.Max(0f, margin) * 2f);
+
             return source;
         }
 
-        private static void EnsureAssetFolder(string folder)
+        private static void EnsureAssetFolder(
+            string folder)
         {
-            folder = folder.Replace('\\', '/').TrimEnd('/');
+            folder =
+                folder
+                    .Replace('\\', '/')
+                    .TrimEnd('/');
 
             if (AssetDatabase.IsValidFolder(folder))
                 return;
 
-            string[] parts = folder.Split('/');
-            if (parts.Length == 0 || parts[0] != "Assets")
-                throw new ArgumentException("Output folder must be under Assets/.", nameof(folder));
+            string[] parts =
+                folder.Split('/');
+
+            if (parts.Length == 0 ||
+                parts[0] != "Assets")
+            {
+                throw new ArgumentException(
+                    "Output folder must be under Assets/.",
+                    nameof(folder));
+            }
 
             string current = "Assets";
 
-            for (int i = 1; i < parts.Length; i++)
+            for (int i = 1;
+                 i < parts.Length;
+                 i++)
             {
-                string next = current + "/" + parts[i];
+                string next =
+                    current + "/" + parts[i];
 
                 if (!AssetDatabase.IsValidFolder(next))
-                    AssetDatabase.CreateFolder(current, parts[i]);
+                {
+                    AssetDatabase.CreateFolder(
+                        current,
+                        parts[i]);
+                }
 
                 current = next;
             }
         }
 
-        private static string MakeSafeFileName(string name)
+        private static string MakeSafeFileName(
+            string name)
         {
-            foreach (char invalid in Path.GetInvalidFileNameChars())
-                name = name.Replace(invalid, '_');
+            foreach (char invalid in
+                     Path.GetInvalidFileNameChars())
+            {
+                name =
+                    name.Replace(
+                        invalid,
+                        '_');
+            }
 
             return name;
         }

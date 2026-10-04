@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.7
+// Prototype version: 0.0.8
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 7;
+        private const int CurrentUiVersion = 8;
 
         [SerializeField] private int _uiVersion;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -83,7 +83,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.7: checked bones are the INCLUDED proxy region. " +
+                "Prototype 0.0.8: checked bones are the INCLUDED proxy region. " +
                 "A vertex is selected by the summed skin weight of checked bones. " +
                 "When all renderer bones are checked, selection filtering is bypassed and the full source body is used.",
                 MessageType.Info);
@@ -407,8 +407,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             _fadeStrength =
                 EditorGUILayout.Slider(
                     new GUIContent(
-                        "Fade Strength",
-                        "Opacity of the outer/mid shells."),
+                        "Fade To Core",
+                        "How far the pre-core fade reaches toward Core Black Strength. " +
+                        "0% = no pre-core darkening; 100% = the mid shell already reaches the same darkness as the core."),
                     _fadeStrength,
                     0f,
                     1f);
@@ -417,10 +418,17 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorGUILayout.Slider(
                     new GUIContent(
                         "Core Black Strength",
-                        "Opacity while the camera is inside the core volume."),
+                        "Final cumulative black opacity inside the core volume. " +
+                        "Fade passes are compensated so this value remains the actual final darkness."),
                     _coreStrength,
                     0f,
                     1f);
+
+            EditorGUILayout.HelpBox(
+                "Fade To Core now controls the fade endpoint relative to Core Black Strength. " +
+                "At 100%, the fade reaches core darkness before entering the core; at 0%, only the core darkens. " +
+                "The outer shell remains intentionally subtle at 20% of the selected fade endpoint.",
+                MessageType.None);
         }
 
         private void DrawOutputSection()

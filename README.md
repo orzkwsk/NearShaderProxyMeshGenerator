@@ -179,7 +179,7 @@ The shader compensates for cumulative alpha blending between Outer -> Mid -> Cor
 
 The outer shell remains intentionally subtle at 20% of the selected fade endpoint; the mid pass adds only the incremental alpha required to reach the requested fade endpoint.
 
-`Shaders/orz_Shop/NearShaderProxyVolume.shader` uses the generated closed mesh as the proximity volume.
+`Shaders/orz_Shop_NearShaderProxyVolume.shader` uses the generated closed mesh as the proximity volume.
 
 It does not use the original shader's object-origin distance or fixed `vertex *= 3` expansion.
 

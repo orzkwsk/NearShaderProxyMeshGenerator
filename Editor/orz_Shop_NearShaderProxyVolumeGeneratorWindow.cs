@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.6
+// Prototype version: 0.0.7
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 6;
+        private const int CurrentUiVersion = 7;
 
         [SerializeField] private int _uiVersion;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -24,6 +24,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         [SerializeField] private float _meshQuality = 1f;
         [SerializeField] private float _surfaceOffset = 0f;
         [SerializeField] private bool _sealOpenBoundaries = true;
+        [SerializeField] private bool _planarBoneCaps = true;
 
         [SerializeField] private float _fadeDistance = 0.05f;
         [SerializeField] private float _fadeStrength = 0.2f;
@@ -63,6 +64,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             _selectionThreshold = 0.25f;
             _meshQuality = 1f;
             _surfaceOffset = 0f;
+            _planarBoneCaps = true;
 
             // Boundary-bone semantics from 0.0.2-0.0.4 are intentionally discarded.
             // 0.0.5+ uses explicit included-bone selection; 0.0.6 resets quality to the safe 100% default.
@@ -81,7 +83,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.6: checked bones are the INCLUDED proxy region. " +
+                "Prototype 0.0.7: checked bones are the INCLUDED proxy region. " +
                 "A vertex is selected by the summed skin weight of checked bones. " +
                 "When all renderer bones are checked, selection filtering is bypassed and the full source body is used.",
                 MessageType.Info);
@@ -350,9 +352,22 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         "Fill open loops before simplification. Required for stencil-parity inside/outside detection."),
                     _sealOpenBoundaries);
 
+            using (new EditorGUI.DisabledScope(!_sealOpenBoundaries))
+            {
+                _planarBoneCaps =
+                    EditorGUILayout.Toggle(
+                        new GUIContent(
+                            "Planar Bone Caps",
+                            "When a region boundary corresponds to a selected/unselected bone transition, " +
+                            "snap that opening to the bind-pose joint plane and rigidly weight the cut ring to the selected-side bone. " +
+                            "This produces simple flat end caps instead of preserving the curved weight boundary."),
+                        _planarBoneCaps);
+            }
+
             EditorGUILayout.HelpBox(
                 "Simplification is performed only after the proxy is sealed. " +
-                "Only connected interior edges are collapsed, and each pass is rejected if it creates boundary or non-manifold edges. " +
+                "With Planar Bone Caps enabled, selected-region openings are flattened at bone-transition planes first, " +
+                "then topology-safe edge collapse reduces the body-following surface and cap rings. " +
                 "The requested quality is a target, not a guarantee.",
                 MessageType.None);
 
@@ -362,6 +377,15 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     "Very low quality can hit the topology/face-orientation limit before the target ratio is reached. " +
                     "In that case the reducer intentionally stops early rather than creating stencil leaks.",
                     MessageType.Warning);
+            }
+
+            if (_planarBoneCaps &&
+                !AreAllSourceBonesSelected())
+            {
+                EditorGUILayout.HelpBox(
+                    "Planar Bone Caps uses selected/unselected transitions in the renderer bone hierarchy. " +
+                    "The cut plane is placed at the child joint in bind pose and the cap ring is rigidly weighted to the selected-side bone.",
+                    MessageType.Info);
             }
         }
 
@@ -594,6 +618,27 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 "Non-Manifold Edges After Seal",
                 _lastResult.NonManifoldEdgesAfterSeal.ToString("N0"));
 
+            EditorGUILayout.Space(4f);
+            EditorGUILayout.LabelField(
+                "Planar Cap Diagnostics",
+                EditorStyles.boldLabel);
+
+            EditorGUILayout.LabelField(
+                "Bone Cut Planes",
+                _lastResult.BoneCutPlaneCount.ToString("N0"));
+
+            EditorGUILayout.LabelField(
+                "Planar Caps",
+                _lastResult.PlanarCapCount.ToString("N0"));
+
+            EditorGUILayout.LabelField(
+                "Fallback Caps",
+                _lastResult.FallbackCapCount.ToString("N0"));
+
+            EditorGUILayout.LabelField(
+                "Vertices Snapped To Cut Planes",
+                _lastResult.PlanarSnappedVertexCount.ToString("N0"));
+
             if (_lastResult.BoundaryEdgesAfterSeal == 0 &&
                 _lastResult.NonManifoldEdgesAfterSeal == 0)
             {
@@ -643,6 +688,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         _meshQuality,
                         _surfaceOffset,
                         _sealOpenBoundaries,
+                        _planarBoneCaps,
                         _fadeDistance,
                         _fadeStrength,
                         _coreStrength,
@@ -667,6 +713,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     $"(target {_lastResult.TargetTriangleCount}, collapses {_lastResult.SimplificationCollapseCount}), " +
                     $"Proxy V {_lastResult.ProxyVertexCount}, " +
                     $"Boundary {_lastResult.BoundaryEdgesBeforeSeal}->{_lastResult.BoundaryEdgesAfterSeal}, " +
+                    $"PlanarCaps {_lastResult.PlanarCapCount}, FallbackCaps {_lastResult.FallbackCapCount}, " +
                     $"NonManifold {_lastResult.NonManifoldEdgesAfterSeal}.",
                     _lastResult.ProxyObject);
             }

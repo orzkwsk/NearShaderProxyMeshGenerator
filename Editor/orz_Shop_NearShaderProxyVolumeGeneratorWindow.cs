@@ -47,6 +47,12 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             _boneCutBias = 0f;
             _mergeSize = 0f;
             _surfaceOffset = 0f;
+
+            // 0.0.3 could retain previously added boundary bones in the EditorWindow.
+            // Clear them once on migration so single-bone validation starts from a known state.
+            if (_uiVersion < 4)
+                _cutoffBones = new List<Transform>();
+
             _uiVersion = CurrentUiVersion;
         }
 

@@ -6,6 +6,7 @@
 // - Vertex selection = sum of weights assigned to checked bones.
 // - All bones selected bypasses filtering and reproduces the full source mesh.
 // - Source skinning is read with BoneWeight1 so selection is not limited to four influences.
+// - Polygon reduction uses conservative topology-safe connected edge collapses after sealing.
 
 using System;
 using System.Collections.Generic;

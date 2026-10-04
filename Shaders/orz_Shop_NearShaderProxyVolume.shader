@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.6
+// Prototype version: 0.0.7
 // Closed-volume camera proximity effect using stencil parity.
 
 Shader "orz_Shop/NearShaderProxyVolume"

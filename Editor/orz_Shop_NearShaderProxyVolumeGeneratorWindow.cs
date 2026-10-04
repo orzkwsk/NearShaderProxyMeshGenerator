@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.3
+// Prototype version: 0.0.4
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 3;
+        private const int CurrentUiVersion = 4;
 
         [SerializeField] private int _uiVersion = 0;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -56,7 +56,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             EditorGUILayout.LabelField("Near Shader Proxy Volume Generator", EditorStyles.boldLabel);
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.3: selected bones are terminal boundaries. " +
+                "Prototype 0.0.4: selected bones are terminal boundaries. " +
                 "The selected bone itself is kept; geometry weighted toward its descendant bones is removed, " +
                 "then open boundaries are sealed for the volume shader.",
                 MessageType.Info);
@@ -161,6 +161,15 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
                 using (new EditorGUI.DisabledScope(Selection.activeTransform == null))
                 {
+                    if (GUILayout.Button("Use Selected Bone (Replace)"))
+                    {
+                        _cutoffBones.Clear();
+                        _cutoffBones.Add(Selection.activeTransform);
+                    }
+                }
+
+                using (new EditorGUI.DisabledScope(Selection.activeTransform == null))
+                {
                     if (GUILayout.Button("Add Selected Bone"))
                     {
                         Transform selected = Selection.activeTransform;
@@ -175,6 +184,10 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         _cutoffBones.Clear();
                 }
             }
+
+            EditorGUILayout.HelpBox(
+                $"Active Boundary Count: {_cutoffBones.Count}. For single-bone tests use 'Use Selected Bone (Replace)' so old boundaries cannot remain active.",
+                _cutoffBones.Count > 1 ? MessageType.Warning : MessageType.None);
 
             _boneCutBias = EditorGUILayout.Slider(
                 new GUIContent(
@@ -383,6 +396,24 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     MessageType.Warning);
             }
 
+            if (_lastResult.BoundaryDiagnostics != null &&
+                _lastResult.BoundaryDiagnostics.Count > 0)
+            {
+                EditorGUILayout.Space(4f);
+                EditorGUILayout.LabelField("Boundary Diagnostics", EditorStyles.boldLabel);
+
+                foreach (var diagnostic in _lastResult.BoundaryDiagnostics)
+                {
+                    float ratio = diagnostic.SourceVertexCount > 0
+                        ? (float)diagnostic.DistalVertexCount / diagnostic.SourceVertexCount
+                        : 0f;
+
+                    EditorGUILayout.LabelField(
+                        diagnostic.BoneName,
+                        $"Index {diagnostic.BoneIndex}, descendants {diagnostic.DescendantBoneCount}, distal vertices {diagnostic.DistalVertexCount:N0} ({ratio:P1})");
+                }
+            }
+
             EditorGUILayout.LabelField(
                 "Boundary Edges Before Seal",
                 _lastResult.BoundaryEdgesBeforeSeal.ToString("N0"));
@@ -464,7 +495,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     $"V {_lastResult.SourceVertexCount} -> {_lastResult.ProxyVertexCount}, " +
                     $"T {_lastResult.SourceTriangleCount} -> {_lastResult.ProxyTriangleCount}, " +
                     $"Boundary {_lastResult.BoundaryEdgesBeforeSeal} -> {_lastResult.BoundaryEdgesAfterSeal}, " +
-                    $"NonManifold {_lastResult.NonManifoldEdgesAfterSeal}.",
+                    $"NonManifold {_lastResult.NonManifoldEdgesAfterSeal}, " +
+                    $"Boundaries {_lastResult.CutPlaneCount}.",
                     _lastResult.ProxyObject);
             }
             catch (Exception ex)

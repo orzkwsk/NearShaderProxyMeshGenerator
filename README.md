@@ -12,7 +12,7 @@ The proxy is backing geometry for a camera near/proximity shader. It is not a vi
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## 0.0.8 fade-to-core shader adjustment
+## 0.0.9 four-band smooth proximity fade
 
 Open:
 
@@ -167,17 +167,23 @@ When **Select All** is active, the result must say that bone selection was bypas
 
 ## Shader
 
-### 0.0.8 fade-to-core behavior
+### 0.0.9 four-band fade behavior
 
-`Fade To Core` (stored in the existing `_FadeStrength` material property) is now interpreted as how far the pre-core fade should progress toward `Core Black Strength`.
+`Fade To Core` (stored in the existing `_FadeStrength` material property) still controls how far the pre-core fade progresses toward `Core Black Strength`.
 
-- 0%: no pre-core darkening; only the core applies black.
-- 50%: the mid shell reaches half of Core Black Strength.
-- 100%: the mid shell already reaches the same darkness as the core.
+The old Outer / Mid / Core layout produced visibly harsh spatial steps. 0.0.9 replaces it with four nested fade shells at:
 
-The shader compensates for cumulative alpha blending between Outer -> Mid -> Core. This means `Core Black Strength` is now the actual final cumulative opacity inside the core, rather than being stacked on top of already-applied fade passes.
+- 100% of Fade Distance;
+- 75%;
+- 50%;
+- 25%;
+- then the core.
 
-The outer shell remains intentionally subtle at 20% of the selected fade endpoint; the mid pass adds only the incremental alpha required to reach the requested fade endpoint.
+The target cumulative opacity of those four bands follows a smoothstep curve sampled at each band's midpoint. This produces a much finer approximation of a continuous gradient while keeping the closed-volume stencil-parity approach.
+
+Per-pass alpha is still compensated for cumulative blending, so `Core Black Strength` remains the actual final opacity inside the core.
+
+Current cost is 10 passes total: parity + color for four fade shells plus the core.
 
 `Shaders/orz_Shop_NearShaderProxyVolume.shader` uses the generated closed mesh as the proximity volume.
 

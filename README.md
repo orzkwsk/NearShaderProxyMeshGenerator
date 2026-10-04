@@ -12,7 +12,7 @@ The proxy is backing geometry for a camera near/proximity shader. It is not a vi
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## 0.0.7 body-following surface + planar bone caps
+## 0.0.8 fade-to-core shader adjustment
 
 Open:
 
@@ -167,7 +167,19 @@ When **Select All** is active, the result must say that bone selection was bypas
 
 ## Shader
 
-`Shaders/orz_Shop_NearShaderProxyVolume.shader` uses the generated closed mesh as the proximity volume.
+### 0.0.8 fade-to-core behavior
+
+`Fade To Core` (stored in the existing `_FadeStrength` material property) is now interpreted as how far the pre-core fade should progress toward `Core Black Strength`.
+
+- 0%: no pre-core darkening; only the core applies black.
+- 50%: the mid shell reaches half of Core Black Strength.
+- 100%: the mid shell already reaches the same darkness as the core.
+
+The shader compensates for cumulative alpha blending between Outer -> Mid -> Core. This means `Core Black Strength` is now the actual final cumulative opacity inside the core, rather than being stacked on top of already-applied fade passes.
+
+The outer shell remains intentionally subtle at 20% of the selected fade endpoint; the mid pass adds only the incremental alpha required to reach the requested fade endpoint.
+
+`Shaders/orz_Shop/NearShaderProxyVolume.shader` uses the generated closed mesh as the proximity volume.
 
 It does not use the original shader's object-origin distance or fixed `vertex *= 3` expansion.
 

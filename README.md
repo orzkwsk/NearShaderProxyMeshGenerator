@@ -12,7 +12,7 @@ The proxy is backing geometry for a camera near/proximity shader. It is not a vi
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## 0.0.9 four-band smooth proximity fade
+## 0.0.10 continuous surface-distance fade
 
 Open:
 
@@ -55,11 +55,13 @@ Source SkinnedMeshRenderer
         |
         +-- epsilon weld
         |
-        +-- optional Merge Size simplification
+        +-- epsilon weld
+        |
+        +-- boundary-loop sealing / planar bone caps
+        |
+        +-- topology-safe edge-collapse simplification
         |
         +-- optional Surface Offset
-        |
-        +-- boundary-loop sealing
         |
         +-- closed SkinnedMesh proxy
 ```
@@ -73,7 +75,7 @@ Generated vertices keep interpolated skinning. Output skinning is normalized to 
 - Core Surface Offset: `0`
 - Seal Open Boundaries: On
 - Fade Distance: `0.05`
-- Fade Strength: `0.2`
+- Fade To Core: `1.0`
 - Core Black Strength: `1.0`
 
 `Mesh Quality = 100%` disables intentional polygon reduction. A very small positional weld is still used to reconnect duplicated triangle vertices / source seams.
@@ -167,37 +169,37 @@ When **Select All** is active, the result must say that bone selection was bypas
 
 ## Shader
 
-### 0.0.9 four-band fade behavior
+### 0.0.10 continuous surface-distance fade
 
-`Fade To Core` (stored in the existing `_FadeStrength` material property) still controls how far the pre-core fade progresses toward `Core Black Strength`.
+The stepped shell approximation has been removed.
 
-The old Outer / Mid / Core layout produced visibly harsh spatial steps. 0.0.9 replaces it with four nested fade shells at:
+The shader now uses three passes total:
 
-- 100% of Fade Distance;
-- 75%;
-- 50%;
-- 25%;
-- then the core.
+1. **CORE_PARITY** — stencil parity determines whether each camera ray starts inside the closed proxy;
+2. **SURFACE_FADE** — outside only, one surface pass computes continuous camera-to-fragment distance;
+3. **CORE_BLACK** — inside only, applies `Core Black Strength` and clears the stencil bit.
 
-The target cumulative opacity of those four bands follows a smoothstep curve sampled at each band's midpoint. This produces a much finer approximation of a continuous gradient while keeping the closed-volume stencil-parity approach.
+Outside the proxy, the fade value is evaluated per fragment:
 
-Per-pass alpha is still compensated for cumulative blending, so `Core Black Strength` remains the actual final opacity inside the core.
+```text
+surfaceDistance = distance(camera, proxy surface fragment)
+proximity       = 1 - surfaceDistance / FadeDistance
+opacity         = smoothstep(0, 1, proximity)
+                  * CoreBlackStrength
+                  * FadeToCore
+```
 
-Current cost is 10 passes total: parity + color for four fade shells plus the core.
+There are no expanded fade shells and therefore no spatial band boundaries.
 
-`Shaders/orz_Shop_NearShaderProxyVolume.shader` uses the generated closed mesh as the proximity volume.
+`Fade To Core = 100%` is the continuity setting: immediately outside the proxy surface, the fade approaches the same opacity used by the core. Lower values intentionally leave a darker jump when the camera crosses into the core.
 
-It does not use the original shader's object-origin distance or fixed `vertex *= 3` expansion.
+The fade pass runs only where the parity stencil says the camera is outside the proxy. The core pass runs only where parity says it is inside.
 
-It currently renders three shells:
+This changes the rendering cost from the 0.0.9 ten-pass shell implementation to three passes.
 
-- core: source/proxy surface;
-- mid: half Fade Distance;
-- outer: full Fade Distance.
+Important limitation: this is camera-to-rendered-surface-fragment distance, not an exact nearest-point signed distance field. It is intended as a practical continuous proximity fade for the body-following proxy.
 
-Each shell uses stencil parity to determine whether the camera ray starts inside the closed volume.
-
-The shader currently uses stencil bit `128`.
+The shader uses stencil bit `128`.
 
 ## Closed-volume requirement
 
@@ -224,7 +226,8 @@ The simple cap generator is intentionally not suitable for visible rendering; it
 - It uses shortest-edge style collapse cost with normal and skin-weight penalties rather than a full production QEM implementation.
 - Complex branching/non-manifold boundary loops may not be sealable by the simple fan-cap implementation.
 - Self-intersection is not resolved.
-- The volume shader uses six passes and stencil bit 128.
+- The volume shader uses three passes and stencil bit 128.
+- Continuous surface fade is based on camera-to-fragment distance, not a true animated SDF / exact nearest-point distance.
 - Runtime/VR validation is still required before merging to `dev`.
 - Editor-time simplification cost increases with source polygon count and aggressive quality targets.
 

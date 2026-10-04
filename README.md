@@ -12,7 +12,7 @@ The proxy is backing geometry for a camera near/proximity shader. It is not a vi
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## 0.0.5 selection model
+## 0.0.6 selection + topology-safe simplification
 
 Open:
 
@@ -69,16 +69,34 @@ Generated vertices keep interpolated skinning. Output skinning is normalized to 
 ## Conservative defaults
 
 - Bone Weight Threshold: `0.25`
-- Merge Size: `0`
+- Mesh Quality: `100%`
 - Core Surface Offset: `0`
 - Seal Open Boundaries: On
 - Fade Distance: `0.05`
 - Fade Strength: `0.2`
 - Core Black Strength: `1.0`
 
-`Merge Size = 0` performs no intentional low-poly reduction. Only a very small positional weld is used to reconnect duplicated triangle vertices / source seams.
+`Mesh Quality = 100%` disables intentional polygon reduction. A very small positional weld is still used to reconnect duplicated triangle vertices / source seams.
 
-First confirm region extraction with Merge Size and Surface Offset at zero. Simplification comes afterwards.
+### Mesh Quality
+
+The quality slider is a **target triangle ratio**, not a destructive merge radius.
+
+The pipeline is:
+
+```text
+bone-region extraction
+  -> epsilon weld
+  -> seal open boundaries
+  -> verify closed 2-manifold
+  -> topology-safe edge collapse
+  -> surface offset
+  -> final topology check
+```
+
+The edge-collapse reducer only collapses existing connected interior edges. A collapse is rejected when it violates the manifold link condition, flips/severely folds neighboring triangles, or would make a simplification pass produce boundary/non-manifold edges.
+
+If a requested ratio cannot be reached safely, simplification stops early. The result panel reports the requested target, achieved triangle ratio, safe collapse count, and stop reason. This is intentional: preserving the closed volume required by stencil parity has priority over reaching an exact polygon count.
 
 ## Bone UI
 
@@ -104,11 +122,16 @@ The result panel reports:
 - selected bone count;
 - source vertices passing the weight threshold;
 - triangles after region clipping;
+- triangles before simplification;
+- target triangles from Mesh Quality;
 - final proxy vertex/triangle count;
+- achieved triangle ratio;
+- accepted safe edge-collapse count;
+- simplifier stop reason when the target could not be reached;
 - whether selection filtering was bypassed;
 - per-selected-bone influenced vertex count (up to 16 selected bones);
-- boundary edges before/after sealing;
-- non-manifold edges after sealing.
+- boundary edges before sealing and after final generation;
+- non-manifold edges after final generation.
 
 When **Select All** is active, the result must say that bone selection was bypassed. If the upper body is still missing in that state, the defect is outside bone selection and should be investigated in geometry/index/weld/seal/rendering.
 
@@ -148,11 +171,13 @@ The simple cap generator is intentionally not suitable for visible rendering; it
 - Tangents are not generated.
 - UV fidelity is not a goal.
 - Output skinning is reduced to four influences even when source selection analysis used more than four.
-- Position-based merging can join nearby surfaces if Merge Size is increased too far.
-- Complex branching/non-manifold boundary loops may not be sealed by the simple fan-cap implementation.
+- The topology-safe reducer is intentionally conservative and may stop well above very aggressive target ratios.
+- It uses shortest-edge style collapse cost with normal and skin-weight penalties rather than a full production QEM implementation.
+- Complex branching/non-manifold boundary loops may not be sealable by the simple fan-cap implementation.
 - Self-intersection is not resolved.
 - The volume shader uses six passes and stencil bit 128.
 - Runtime/VR validation is still required before merging to `dev`.
+- Editor-time simplification cost increases with source polygon count and aggressive quality targets.
 
 ## Legacy baseline
 

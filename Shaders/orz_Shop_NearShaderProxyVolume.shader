@@ -1,7 +1,8 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.11
+// Prototype version: 0.0.12
 // Eight nested closed-volume fade shells + inward core.
-// Validation shader: prioritizes visual continuity over pass count.
+// Proxy geometry is stencil-only. A tagged helper triangle resolves each
+// shell/core to fullscreen exactly once per pixel.
 
 Shader "orz_Shop/NearShaderProxyVolume"
 {
@@ -38,11 +39,14 @@ Shader "orz_Shop/NearShaderProxyVolume"
         {
             float4 vertex : POSITION;
             float3 normal : NORMAL;
+            float4 renderData : TEXCOORD1;
+            UNITY_VERTEX_INPUT_INSTANCE_ID
         };
 
         struct v2f
         {
             float4 pos : SV_POSITION;
+            UNITY_VERTEX_OUTPUT_STEREO
         };
 
         float Smooth01(float t)
@@ -52,34 +56,76 @@ Shader "orz_Shop/NearShaderProxyVolume"
         }
 
         // t=0 is the outer edge, t=1 is the inset core boundary.
-        // Smooth01 makes shells denser near both ends and wider in the middle.
         float ShellOffset(float t)
         {
             float positionT = Smooth01(t);
             return lerp(_FadeDistance, -_CoreInset, positionT);
         }
 
-        v2f ExpandVertex(appdata v, float distance)
+        v2f VolumeVertex(appdata v, float distance)
         {
             v2f o;
-            float3 worldPosition = mul(unity_ObjectToWorld, v.vertex).xyz;
-            float3 worldNormal = UnityObjectToWorldNormal(v.normal);
-            worldPosition += normalize(worldNormal) * distance;
-            o.pos = UnityWorldToClipPos(worldPosition);
+            UNITY_SETUP_INSTANCE_ID(v);
+            UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
+
+            float marker = step(0.5, v.renderData.z);
+
+            float3 worldPosition =
+                mul(unity_ObjectToWorld, v.vertex).xyz;
+
+            float3 worldNormal =
+                UnityObjectToWorldNormal(v.normal);
+
+            worldPosition +=
+                normalize(worldNormal) * distance;
+
+            float4 volumeClip =
+                UnityWorldToClipPos(worldPosition);
+
+            // Tagged helper vertices never participate in parity.
+            float4 offscreen =
+                float4(2.0, 2.0, 2.0, 1.0);
+
+            o.pos =
+                lerp(volumeClip, offscreen, marker);
+
             return o;
         }
 
-        // Midpoints of eight fade bands. Their spatial position is then
-        // redistributed by Smooth01 inside ShellOffset().
-        v2f VertShell1(appdata v) { return ExpandVertex(v, ShellOffset(0.0625)); }
-        v2f VertShell2(appdata v) { return ExpandVertex(v, ShellOffset(0.1875)); }
-        v2f VertShell3(appdata v) { return ExpandVertex(v, ShellOffset(0.3125)); }
-        v2f VertShell4(appdata v) { return ExpandVertex(v, ShellOffset(0.4375)); }
-        v2f VertShell5(appdata v) { return ExpandVertex(v, ShellOffset(0.5625)); }
-        v2f VertShell6(appdata v) { return ExpandVertex(v, ShellOffset(0.6875)); }
-        v2f VertShell7(appdata v) { return ExpandVertex(v, ShellOffset(0.8125)); }
-        v2f VertShell8(appdata v) { return ExpandVertex(v, ShellOffset(0.9375)); }
-        v2f VertCore  (appdata v) { return ExpandVertex(v, -_CoreInset); }
+        v2f FullscreenVertex(appdata v)
+        {
+            v2f o;
+            UNITY_SETUP_INSTANCE_ID(v);
+            UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
+
+            float marker =
+                step(0.5, v.renderData.z);
+
+            float2 clipXY =
+                v.renderData.xy * 2.0 - 1.0;
+
+            float4 fullscreenClip =
+                float4(clipXY, 0.0, 1.0);
+
+            // Normal proxy vertices never participate in fullscreen resolve.
+            float4 offscreen =
+                float4(2.0, 2.0, 2.0, 1.0);
+
+            o.pos =
+                lerp(offscreen, fullscreenClip, marker);
+
+            return o;
+        }
+
+        v2f VertShell1(appdata v) { return VolumeVertex(v, ShellOffset(0.0625)); }
+        v2f VertShell2(appdata v) { return VolumeVertex(v, ShellOffset(0.1875)); }
+        v2f VertShell3(appdata v) { return VolumeVertex(v, ShellOffset(0.3125)); }
+        v2f VertShell4(appdata v) { return VolumeVertex(v, ShellOffset(0.4375)); }
+        v2f VertShell5(appdata v) { return VolumeVertex(v, ShellOffset(0.5625)); }
+        v2f VertShell6(appdata v) { return VolumeVertex(v, ShellOffset(0.6875)); }
+        v2f VertShell7(appdata v) { return VolumeVertex(v, ShellOffset(0.8125)); }
+        v2f VertShell8(appdata v) { return VolumeVertex(v, ShellOffset(0.9375)); }
+        v2f VertCore  (appdata v) { return VolumeVertex(v, -_CoreInset); }
 
         float FadeTargetOpacity()
         {
@@ -88,31 +134,50 @@ Shader "orz_Shop/NearShaderProxyVolume"
 
         float IncrementalAlpha(float previousOpacity, float targetOpacity)
         {
-            previousOpacity = saturate(previousOpacity);
-            targetOpacity = saturate(max(previousOpacity, targetOpacity));
+            previousOpacity =
+                saturate(previousOpacity);
 
-            float remaining = max(1.0 - previousOpacity, 1e-5);
-            return saturate((targetOpacity - previousOpacity) / remaining);
+            targetOpacity =
+                saturate(max(previousOpacity, targetOpacity));
+
+            float remaining =
+                max(1.0 - previousOpacity, 1e-5);
+
+            return saturate(
+                (targetOpacity - previousOpacity) /
+                remaining);
         }
 
         float InterleavedGradientNoise(float2 pixel)
         {
             pixel = floor(pixel);
+
             return frac(
                 52.9829189 *
-                frac(dot(pixel, float2(0.06711056, 0.00583715))));
+                frac(
+                    dot(
+                        pixel,
+                        float2(
+                            0.06711056,
+                            0.00583715))));
         }
 
-        float ApplyShellDither(float alpha, float2 pixel)
+        float ApplyShellDither(
+            float alpha,
+            float2 pixel)
         {
-            float noise = InterleavedGradientNoise(pixel) - 0.5;
+            float noise =
+                InterleavedGradientNoise(pixel) - 0.5;
 
-            // Dither is deliberately subtle. It breaks up a uniform full-screen
-            // opacity jump without replacing alpha blending with hard clipping.
-            float room = min(alpha, 1.0 - alpha);
-            float amplitude = room * _DitherStrength * 0.75;
+            float room =
+                min(alpha, 1.0 - alpha);
 
-            return saturate(alpha + noise * 2.0 * amplitude);
+            float amplitude =
+                room * _DitherStrength * 0.75;
+
+            return saturate(
+                alpha +
+                noise * 2.0 * amplitude);
         }
 
         fixed4 ShellColor(
@@ -120,13 +185,16 @@ Shader "orz_Shop/NearShaderProxyVolume"
             float previousLevel,
             float currentLevel)
         {
-            float fadeTarget = FadeTargetOpacity();
+            float fadeTarget =
+                FadeTargetOpacity();
 
             float previousOpacity =
-                fadeTarget * saturate(previousLevel);
+                fadeTarget *
+                saturate(previousLevel);
 
             float currentOpacity =
-                fadeTarget * saturate(currentLevel);
+                fadeTarget *
+                saturate(currentLevel);
 
             float alpha =
                 IncrementalAlpha(
@@ -143,7 +211,6 @@ Shader "orz_Shop/NearShaderProxyVolume"
                 alpha);
         }
 
-        // Equal cumulative opacity increments keep each temporal shell step small.
         fixed4 FragShell1(v2f i) : SV_Target { return ShellColor(i, 0.000, 0.125); }
         fixed4 FragShell2(v2f i) : SV_Target { return ShellColor(i, 0.125, 0.250); }
         fixed4 FragShell3(v2f i) : SV_Target { return ShellColor(i, 0.250, 0.375); }
@@ -155,12 +222,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
 
         fixed4 FragCore(v2f i) : SV_Target
         {
-            float previousOpacity =
-                FadeTargetOpacity();
-
             float alpha =
                 IncrementalAlpha(
-                    previousOpacity,
+                    FadeTargetOpacity(),
                     saturate(_CoreStrength));
 
             return fixed4(
@@ -186,6 +250,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell1
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -198,8 +263,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell1
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell1
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -215,6 +281,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell2
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -227,8 +294,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell2
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell2
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -244,6 +312,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell3
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -256,8 +325,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell3
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell3
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -273,6 +343,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell4
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -285,8 +356,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell4
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell4
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -302,6 +374,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell5
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -314,8 +387,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell5
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell5
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -331,6 +405,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell6
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -343,8 +418,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell6
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell6
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -360,6 +436,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell7
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -372,8 +449,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell7
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell7
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -389,6 +467,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertShell8
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -401,8 +480,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertShell8
+            #pragma vertex FullscreenVertex
             #pragma fragment FragShell8
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -418,6 +498,7 @@ Shader "orz_Shop/NearShaderProxyVolume"
             CGPROGRAM
             #pragma vertex VertCore
             #pragma fragment FragMask
+            #pragma multi_compile_instancing
             ENDCG
         }
 
@@ -430,8 +511,9 @@ Shader "orz_Shop/NearShaderProxyVolume"
             ZTest Always
             Stencil { Ref 128 ReadMask 128 WriteMask 128 Comp Equal Pass Zero }
             CGPROGRAM
-            #pragma vertex VertCore
+            #pragma vertex FullscreenVertex
             #pragma fragment FragCore
+            #pragma multi_compile_instancing
             ENDCG
         }
     }

@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.10
+// Prototype version: 0.0.11
 //
 // Selection model rewrite:
 // - Checked bones are the INCLUDED proxy region.
@@ -245,7 +245,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             bool sealOpenBoundaries,
             bool planarBoneCaps,
             float fadeDistance,
+            float coreInset,
             float fadeStrength,
+            float ditherStrength,
             float coreStrength,
             string outputFolder,
             bool replaceExisting)
@@ -264,6 +266,12 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             if (fadeDistance < 0f)
                 throw new ArgumentOutOfRangeException(nameof(fadeDistance), "Fade Distance must not be negative.");
+
+            if (coreInset < 0f)
+                throw new ArgumentOutOfRangeException(nameof(coreInset), "Core Inset must not be negative.");
+
+            if (ditherStrength < 0f || ditherStrength > 1f)
+                throw new ArgumentOutOfRangeException(nameof(ditherStrength), "Dither Strength must be between 0 and 1.");
 
             if (string.IsNullOrWhiteSpace(outputFolder) ||
                 !outputFolder.StartsWith("Assets", StringComparison.Ordinal))
@@ -394,7 +402,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     materialPath,
                     replaceExisting,
                     fadeDistance,
+                    coreInset,
                     fadeStrength,
+                    ditherStrength,
                     coreStrength);
             }
 
@@ -2601,7 +2611,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             string path,
             bool replaceExisting,
             float fadeDistance,
+            float coreInset,
             float fadeStrength,
+            float ditherStrength,
             float coreStrength)
         {
             Material existing =
@@ -2641,8 +2653,14 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             if (material.HasProperty("_FadeDistance"))
                 material.SetFloat("_FadeDistance", fadeDistance);
 
+            if (material.HasProperty("_CoreInset"))
+                material.SetFloat("_CoreInset", coreInset);
+
             if (material.HasProperty("_FadeStrength"))
                 material.SetFloat("_FadeStrength", fadeStrength);
+
+            if (material.HasProperty("_DitherStrength"))
+                material.SetFloat("_DitherStrength", ditherStrength);
 
             if (material.HasProperty("_CoreStrength"))
                 material.SetFloat("_CoreStrength", coreStrength);

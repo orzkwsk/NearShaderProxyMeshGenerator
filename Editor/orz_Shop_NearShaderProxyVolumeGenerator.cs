@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.6
+// Prototype version: 0.0.7
 //
 // Selection model rewrite:
 // - Checked bones are the INCLUDED proxy region.
@@ -57,6 +57,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public int BoundaryEdgesBeforeSeal;
             public int BoundaryEdgesAfterSeal;
             public int NonManifoldEdgesAfterSeal;
+
+            public int BoneCutPlaneCount;
+            public int PlanarCapCount;
+            public int FallbackCapCount;
+            public int PlanarSnappedVertexCount;
 
             public bool SelectionBypassed;
             public List<SelectedBoneDiagnostic> SelectedBoneDiagnostics;
@@ -168,6 +173,28 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public int To;
         }
 
+        private sealed class BoneCutPlane
+        {
+            public string Label;
+            public int SelectedBoneIndex;
+            public int OutsideBoneIndex;
+            public Vector3 Point;
+            public Vector3 Normal;
+            public float SegmentLength;
+
+            public Vector3 Project(Vector3 point)
+            {
+                return point - Normal * Vector3.Dot(point - Point, Normal);
+            }
+        }
+
+        private sealed class CapSealStats
+        {
+            public int PlanarCapCount;
+            public int FallbackCapCount;
+            public int SnappedVertexCount;
+        }
+
         private readonly struct TriangleKey : IEquatable<TriangleKey>
         {
             private readonly int _a;
@@ -216,6 +243,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             float meshQuality,
             float surfaceOffset,
             bool sealOpenBoundaries,
+            bool planarBoneCaps,
             float fadeDistance,
             float fadeStrength,
             float coreStrength,
@@ -298,6 +326,13 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             int selectionTriangleCount = selectedTriangles.Count / 3;
 
+            List<BoneCutPlane> boneCutPlanes =
+                BuildBoneCutPlanes(
+                    source,
+                    sourceMesh,
+                    rendererBones,
+                    selectedBoneMask);
+
             // Build topology first with only an epsilon weld. Simplification is deliberately
             // performed after sealing so the reducer starts from a closed 2-manifold whenever possible.
             Mesh proxyMesh = BuildProxy(
@@ -308,14 +343,26 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             Dictionary<EdgeKey, EdgeInfo> beforeEdges = BuildEdgeTable(proxyMesh.triangles);
             int boundaryBeforeSeal = beforeEdges.Count(pair => pair.Value.Count == 1);
 
+            var capStats = new CapSealStats();
+            List<int> planarGroups =
+                Enumerable.Repeat(-1, proxyMesh.vertexCount).ToList();
+
             if (sealOpenBoundaries && boundaryBeforeSeal > 0)
-                SealOpenBoundaries(proxyMesh);
+            {
+                SealOpenBoundaries(
+                    proxyMesh,
+                    planarBoneCaps ? boneCutPlanes : Array.Empty<BoneCutPlane>(),
+                    out planarGroups,
+                    capStats);
+            }
 
             int preSimplifyTriangleCount = proxyMesh.triangles.Length / 3;
 
             SimplificationStats simplification = SimplifyClosedMesh(
                 proxyMesh,
-                meshQuality);
+                meshQuality,
+                planarGroups,
+                boneCutPlanes);
 
             // Surface offset does not change topology, so apply it only after topology-safe
             // simplification has finished.
@@ -406,6 +453,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 BoundaryEdgesBeforeSeal = boundaryBeforeSeal,
                 BoundaryEdgesAfterSeal = boundaryAfterSeal,
                 NonManifoldEdgesAfterSeal = nonManifoldAfterSeal,
+
+                BoneCutPlaneCount = boneCutPlanes.Count,
+                PlanarCapCount = capStats.PlanarCapCount,
+                FallbackCapCount = capStats.FallbackCapCount,
+                PlanarSnappedVertexCount = capStats.SnappedVertexCount,
 
                 SelectionBypassed = allRendererBonesSelected,
                 SelectedBoneDiagnostics = BuildSelectedBoneDiagnostics(
@@ -539,6 +591,144 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                             : 0,
                     SourceVertexCount = sourceVertexCount
                 });
+            }
+
+            return result;
+        }
+
+
+        private static List<BoneCutPlane> BuildBoneCutPlanes(
+            SkinnedMeshRenderer source,
+            Mesh sourceMesh,
+            IReadOnlyList<Transform> rendererBones,
+            IReadOnlyList<bool> selectedBoneMask)
+        {
+            var result = new List<BoneCutPlane>();
+
+            if (rendererBones == null ||
+                rendererBones.Count == 0 ||
+                selectedBoneMask == null ||
+                selectedBoneMask.Count != rendererBones.Count)
+            {
+                return result;
+            }
+
+            var indexByTransform =
+                new Dictionary<Transform, int>();
+
+            for (int i = 0; i < rendererBones.Count; i++)
+            {
+                Transform bone = rendererBones[i];
+
+                if (bone != null &&
+                    !indexByTransform.ContainsKey(bone))
+                {
+                    indexByTransform.Add(bone, i);
+                }
+            }
+
+            Matrix4x4[] bindposes =
+                sourceMesh.bindposes;
+
+            var positions =
+                new Vector3[rendererBones.Count];
+
+            for (int i = 0; i < rendererBones.Count; i++)
+            {
+                if (bindposes != null &&
+                    i < bindposes.Length)
+                {
+                    positions[i] =
+                        bindposes[i]
+                            .inverse
+                            .MultiplyPoint3x4(Vector3.zero);
+                }
+                else if (rendererBones[i] != null)
+                {
+                    positions[i] =
+                        source.transform
+                            .worldToLocalMatrix
+                            .MultiplyPoint3x4(
+                                rendererBones[i].position);
+                }
+            }
+
+            for (int childIndex = 0;
+                 childIndex < rendererBones.Count;
+                 childIndex++)
+            {
+                Transform child =
+                    rendererBones[childIndex];
+
+                if (child == null)
+                    continue;
+
+                Transform ancestor =
+                    child.parent;
+
+                int parentIndex = -1;
+
+                while (ancestor != null)
+                {
+                    if (indexByTransform.TryGetValue(
+                        ancestor,
+                        out parentIndex))
+                    {
+                        break;
+                    }
+
+                    ancestor = ancestor.parent;
+                }
+
+                if (parentIndex < 0)
+                    continue;
+
+                bool childSelected =
+                    selectedBoneMask[childIndex];
+
+                bool parentSelected =
+                    selectedBoneMask[parentIndex];
+
+                if (childSelected == parentSelected)
+                    continue;
+
+                Vector3 parentPosition =
+                    positions[parentIndex];
+
+                Vector3 childPosition =
+                    positions[childIndex];
+
+                Vector3 axis =
+                    childPosition - parentPosition;
+
+                float length =
+                    axis.magnitude;
+
+                if (length <= 1e-5f)
+                    continue;
+
+                int selectedIndex =
+                    childSelected
+                        ? childIndex
+                        : parentIndex;
+
+                int outsideIndex =
+                    childSelected
+                        ? parentIndex
+                        : childIndex;
+
+                result.Add(
+                    new BoneCutPlane
+                    {
+                        Label =
+                            $"{rendererBones[parentIndex].name} -> {rendererBones[childIndex].name}",
+                        SelectedBoneIndex = selectedIndex,
+                        OutsideBoneIndex = outsideIndex,
+                        // The child joint is the natural boundary between the two bone regions.
+                        Point = childPosition,
+                        Normal = axis / length,
+                        SegmentLength = length
+                    });
             }
 
             return result;
@@ -1056,6 +1246,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public Vector3 Normal;
             public Vector2 Uv;
             public BoneWeight BoneWeight;
+            public int PlanarGroup = -1;
         }
 
         private readonly struct CollapseCandidate
@@ -1074,7 +1265,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
         private static SimplificationStats SimplifyClosedMesh(
             Mesh mesh,
-            float meshQuality)
+            float meshQuality,
+            IReadOnlyList<int> initialPlanarGroups,
+            IReadOnlyList<BoneCutPlane> cutPlanes)
         {
             int startTriangleCount = mesh.triangles.Length / 3;
             int targetTriangleCount = Mathf.Max(
@@ -1124,6 +1317,12 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             var triangles = initialTriangles.ToList();
             var active = Enumerable.Repeat(true, vertices.Count).ToArray();
+
+            var planarGroups =
+                initialPlanarGroups != null &&
+                initialPlanarGroups.Count == vertices.Count
+                    ? initialPlanarGroups.ToList()
+                    : Enumerable.Repeat(-1, vertices.Count).ToList();
 
             int passGuard = 0;
 
@@ -1213,8 +1412,35 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         continue;
                     }
 
+                    int planarGroupA = planarGroups[a];
+                    int planarGroupB = planarGroups[b];
+
+                    // Do not collapse across a planar-cap / body-surface boundary,
+                    // or between different cut planes. This keeps the intentional
+                    // flat section stable while still allowing reduction inside it.
+                    if (planarGroupA != planarGroupB &&
+                        (planarGroupA >= 0 || planarGroupB >= 0))
+                    {
+                        continue;
+                    }
+
+                    int proposalPlanarGroup =
+                        planarGroupA >= 0 &&
+                        planarGroupA == planarGroupB
+                            ? planarGroupA
+                            : -1;
+
                     Vector3 newPosition =
                         (vertices[a] + vertices[b]) * 0.5f;
+
+                    if (proposalPlanarGroup >= 0 &&
+                        cutPlanes != null &&
+                        proposalPlanarGroup < cutPlanes.Count)
+                    {
+                        newPosition =
+                            cutPlanes[proposalPlanarGroup]
+                                .Project(newPosition);
+                    }
 
                     if (!PassesCollapseGeometryCheck(
                         a,
@@ -1249,7 +1475,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                             BoneWeight = LerpBoneWeight(
                                 weights[a],
                                 weights[b],
-                                0.5f)
+                                0.5f),
+                            PlanarGroup = proposalPlanarGroup
                         });
 
                     LockOneRing(locked, a, neighbors);
@@ -1298,6 +1525,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     normals[proposal.Keep] = proposal.Normal;
                     uvs[proposal.Keep] = proposal.Uv;
                     weights[proposal.Keep] = proposal.BoneWeight;
+                    planarGroups[proposal.Keep] = proposal.PlanarGroup;
+                    planarGroups[proposal.Remove] = -2;
                     active[proposal.Remove] = false;
                     stats.CollapseCount++;
                 }
@@ -1696,6 +1925,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 compactTriangles.Add(newIndex);
             }
 
+            Matrix4x4[] bindposes =
+                mesh.bindposes;
+
             mesh.Clear();
             mesh.indexFormat =
                 compactVertices.Count > 65535
@@ -1706,6 +1938,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             mesh.SetNormals(compactNormals);
             mesh.SetUVs(0, compactUvs);
             mesh.boneWeights = compactWeights.ToArray();
+            mesh.bindposes = bindposes;
             mesh.SetTriangles(compactTriangles, 0, true);
             mesh.RecalculateBounds();
         }
@@ -1778,7 +2011,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             }
         }
 
-        private static void SealOpenBoundaries(Mesh mesh)
+        private static void SealOpenBoundaries(
+            Mesh mesh,
+            IReadOnlyList<BoneCutPlane> cutPlanes,
+            out List<int> planarGroups,
+            CapSealStats stats)
         {
             var vertices = mesh.vertices.ToList();
             var normals = mesh.normals.ToList();
@@ -1791,7 +2028,11 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             var weights = mesh.boneWeights.ToList();
             var triangles = mesh.triangles.ToList();
 
-            Dictionary<EdgeKey, EdgeInfo> edgeTable = BuildEdgeTable(triangles);
+            planarGroups =
+                Enumerable.Repeat(-1, vertices.Count).ToList();
+
+            Dictionary<EdgeKey, EdgeInfo> edgeTable =
+                BuildEdgeTable(triangles);
 
             List<EdgeInfo> boundary =
                 edgeTable.Values
@@ -1801,7 +2042,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             if (boundary.Count == 0)
                 return;
 
-            var adjacency = new Dictionary<int, List<EdgeInfo>>();
+            var adjacency =
+                new Dictionary<int, List<EdgeInfo>>();
 
             foreach (EdgeInfo edge in boundary)
             {
@@ -1809,19 +2051,26 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 AddAdjacency(adjacency, edge.To, edge);
             }
 
-            var used = new HashSet<EdgeKey>();
+            var used =
+                new HashSet<EdgeKey>();
+
+            var snappedVertices =
+                new HashSet<int>();
 
             foreach (EdgeInfo first in boundary)
             {
-                EdgeKey firstKey = new EdgeKey(first.From, first.To);
+                EdgeKey firstKey =
+                    new EdgeKey(first.From, first.To);
+
                 if (used.Contains(firstKey))
                     continue;
 
-                var loop = new List<int>
-                {
-                    first.From,
-                    first.To
-                };
+                var loop =
+                    new List<int>
+                    {
+                        first.From,
+                        first.To
+                    };
 
                 used.Add(firstKey);
 
@@ -1847,7 +2096,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                     foreach (EdgeInfo candidate in connected)
                     {
                         EdgeKey candidateKey =
-                            new EdgeKey(candidate.From, candidate.To);
+                            new EdgeKey(
+                                candidate.From,
+                                candidate.To);
 
                         if (used.Contains(candidateKey))
                             continue;
@@ -1890,8 +2141,52 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 if (!closed || loop.Count < 3)
                     continue;
 
+                int planeIndex =
+                    FindBestBoneCutPlane(
+                        loop,
+                        vertices,
+                        weights,
+                        cutPlanes);
+
+                BoneCutPlane plane =
+                    planeIndex >= 0 &&
+                    cutPlanes != null &&
+                    planeIndex < cutPlanes.Count
+                        ? cutPlanes[planeIndex]
+                        : null;
+
+                if (plane != null)
+                {
+                    BoneWeight rigidWeight =
+                        MakeRigidBoneWeight(
+                            plane.SelectedBoneIndex);
+
+                    foreach (int index in loop)
+                    {
+                        vertices[index] =
+                            plane.Project(
+                                vertices[index]);
+
+                        weights[index] =
+                            rigidWeight;
+
+                        planarGroups[index] =
+                            planeIndex;
+
+                        if (snappedVertices.Add(index))
+                            stats.SnappedVertexCount++;
+                    }
+
+                    stats.PlanarCapCount++;
+                }
+                else
+                {
+                    stats.FallbackCapCount++;
+                }
+
                 Vector3 center = Vector3.zero;
                 Vector2 uvCenter = Vector2.zero;
+
                 var accumulatedWeights =
                     new Dictionary<int, float>();
 
@@ -1909,6 +2204,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 center /= loop.Count;
                 uvCenter /= loop.Count;
 
+                if (plane != null)
+                    center = plane.Project(center);
+
                 Vector3 loopNormal = Vector3.zero;
 
                 for (int i = 0; i < loop.Count; i++)
@@ -1921,25 +2219,65 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         vertices[loop[(i + 1) % loop.Count]] -
                         center;
 
-                    loopNormal += Vector3.Cross(a, b);
+                    loopNormal +=
+                        Vector3.Cross(a, b);
                 }
 
-                Vector3 capNormal =
-                    loopNormal.sqrMagnitude > 1e-12f
-                        ? -loopNormal.normalized
-                        : Vector3.up;
+                Vector3 capNormal;
 
-                int centerIndex = vertices.Count;
+                if (plane != null)
+                {
+                    capNormal =
+                        plane.Normal;
+
+                    if (loopNormal.sqrMagnitude > 1e-12f &&
+                        Vector3.Dot(
+                            capNormal,
+                            loopNormal) > 0f)
+                    {
+                        capNormal = -capNormal;
+                    }
+                }
+                else
+                {
+                    capNormal =
+                        loopNormal.sqrMagnitude > 1e-12f
+                            ? -loopNormal.normalized
+                            : Vector3.up;
+                }
+
+                int centerIndex =
+                    vertices.Count;
 
                 vertices.Add(center);
                 normals.Add(capNormal);
                 uvs.Add(uvCenter);
-                weights.Add(
-                    BuildBoneWeight(accumulatedWeights));
 
-                for (int i = 0; i < loop.Count; i++)
+                if (plane != null)
                 {
-                    int currentIndex = loop[i];
+                    weights.Add(
+                        MakeRigidBoneWeight(
+                            plane.SelectedBoneIndex));
+
+                    planarGroups.Add(
+                        planeIndex);
+                }
+                else
+                {
+                    weights.Add(
+                        BuildBoneWeight(
+                            accumulatedWeights));
+
+                    planarGroups.Add(-1);
+                }
+
+                for (int i = 0;
+                     i < loop.Count;
+                     i++)
+                {
+                    int currentIndex =
+                        loop[i];
+
                     int nextIndex =
                         loop[(i + 1) % loop.Count];
 
@@ -1960,6 +2298,116 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             mesh.boneWeights = weights.ToArray();
             mesh.SetTriangles(triangles, 0, true);
             mesh.RecalculateBounds();
+        }
+
+        private static int FindBestBoneCutPlane(
+            IReadOnlyList<int> loop,
+            IReadOnlyList<Vector3> vertices,
+            IReadOnlyList<BoneWeight> weights,
+            IReadOnlyList<BoneCutPlane> cutPlanes)
+        {
+            if (cutPlanes == null ||
+                cutPlanes.Count == 0 ||
+                loop == null ||
+                loop.Count == 0)
+            {
+                return -1;
+            }
+
+            Vector3 center = Vector3.zero;
+
+            foreach (int index in loop)
+                center += vertices[index];
+
+            center /= loop.Count;
+
+            int bestIndex = -1;
+            float bestScore = float.PositiveInfinity;
+
+            for (int planeIndex = 0;
+                 planeIndex < cutPlanes.Count;
+                 planeIndex++)
+            {
+                BoneCutPlane plane =
+                    cutPlanes[planeIndex];
+
+                if (plane == null)
+                    continue;
+
+                float centerDistance =
+                    Vector3.Distance(
+                        center,
+                        plane.Point);
+
+                float maxMatchDistance =
+                    Mathf.Clamp(
+                        plane.SegmentLength * 1.5f,
+                        0.06f,
+                        0.25f);
+
+                if (centerDistance > maxMatchDistance)
+                    continue;
+
+                float anchorWeight = 0f;
+
+                foreach (int vertexIndex in loop)
+                {
+                    anchorWeight +=
+                        GetBoneWeight(
+                            weights[vertexIndex],
+                            plane.SelectedBoneIndex);
+                }
+
+                anchorWeight /=
+                    loop.Count;
+
+                float planeDistance =
+                    Mathf.Abs(
+                        Vector3.Dot(
+                            center - plane.Point,
+                            plane.Normal));
+
+                float score =
+                    planeDistance +
+                    centerDistance * 0.35f -
+                    anchorWeight * 0.05f;
+
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    bestIndex = planeIndex;
+                }
+            }
+
+            return bestIndex;
+        }
+
+        private static float GetBoneWeight(
+            BoneWeight weight,
+            int boneIndex)
+        {
+            float result = 0f;
+
+            if (weight.boneIndex0 == boneIndex)
+                result += weight.weight0;
+            if (weight.boneIndex1 == boneIndex)
+                result += weight.weight1;
+            if (weight.boneIndex2 == boneIndex)
+                result += weight.weight2;
+            if (weight.boneIndex3 == boneIndex)
+                result += weight.weight3;
+
+            return result;
+        }
+
+        private static BoneWeight MakeRigidBoneWeight(
+            int boneIndex)
+        {
+            return new BoneWeight
+            {
+                boneIndex0 = Mathf.Max(0, boneIndex),
+                weight0 = 1f
+            };
         }
 
         private static void AddAdjacency(

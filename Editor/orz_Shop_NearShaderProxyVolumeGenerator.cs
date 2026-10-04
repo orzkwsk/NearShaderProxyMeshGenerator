@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.9
+// Prototype version: 0.0.10
 //
 // Selection model rewrite:
 // - Checked bones are the INCLUDED proxy region.

@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.10
+// Prototype version: 0.0.11
 
 using System;
 using System.Collections.Generic;
@@ -11,7 +11,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
     internal sealed class orz_Shop_NearShaderProxyVolumeGeneratorWindow : EditorWindow
     {
         private const string DefaultOutputFolder = "Assets/Generated/NearShaderProxyMesh";
-        private const int CurrentUiVersion = 10;
+        private const int CurrentUiVersion = 11;
 
         [SerializeField] private int _uiVersion;
         [SerializeField] private SkinnedMeshRenderer _source;
@@ -27,7 +27,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         [SerializeField] private bool _planarBoneCaps = true;
 
         [SerializeField] private float _fadeDistance = 0.05f;
+        [SerializeField] private float _coreInset = 0.01f;
         [SerializeField] private float _fadeStrength = 1f;
+        [SerializeField] private float _ditherStrength = 0.15f;
         [SerializeField] private float _coreStrength = 1f;
 
         [SerializeField] private string _outputFolder = DefaultOutputFolder;
@@ -76,6 +78,12 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             if (_uiVersion < 10)
                 _fadeStrength = 1f;
 
+            if (_uiVersion < 11)
+            {
+                _coreInset = 0.01f;
+                _ditherStrength = 0.15f;
+            }
+
             SyncSelectedBones();
             _uiVersion = CurrentUiVersion;
         }
@@ -90,7 +98,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "Prototype 0.0.10: checked bones are the INCLUDED proxy region. " +
+                "Prototype 0.0.11: checked bones are the INCLUDED proxy region. " +
                 "A vertex is selected by the summed skin weight of checked bones. " +
                 "When all renderer bones are checked, selection filtering is bypassed and the full source body is used.",
                 MessageType.Info);
@@ -406,19 +414,47 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorGUILayout.Slider(
                     new GUIContent(
                         "Fade Distance",
-                        "Maximum camera-to-proxy-surface distance that produces the outside fade. " +
-                        "The shader evaluates this continuously per fragment; no expanded fade shells are generated."),
+                        "Outward distance from the proxy used by the outermost fade shell."),
                     _fadeDistance,
                     0f,
                     0.25f);
+
+            _coreInset =
+                EditorGUILayout.Slider(
+                    new GUIContent(
+                        "Core Inset",
+                        "Moves the solid-black core inward along vertex normals. " +
+                        "The eight fade shells span from +Fade Distance to -Core Inset."),
+                    _coreInset,
+                    0f,
+                    0.05f);
+
+            using (new EditorGUILayout.HorizontalScope())
+            {
+                if (GUILayout.Button("Core Inset = 0"))
+                    _coreInset = 0f;
+
+                if (GUILayout.Button("Match Fade Distance"))
+                    _coreInset = Mathf.Clamp(_fadeDistance, 0f, 0.05f);
+            }
 
             _fadeStrength =
                 EditorGUILayout.Slider(
                     new GUIContent(
                         "Fade To Core",
-                        "Opacity reached immediately outside the proxy surface, relative to Core Black Strength. " +
-                        "100% gives a continuous transition into the core; lower values intentionally leave a darkness jump at the surface."),
+                        "Cumulative opacity reached by the innermost fade shell relative to Core Black Strength. " +
+                        "100% removes the final opacity jump when entering the inset core."),
                     _fadeStrength,
+                    0f,
+                    1f);
+
+            _ditherStrength =
+                EditorGUILayout.Slider(
+                    new GUIContent(
+                        "Shell Dither",
+                        "Adds subtle stable screen-space opacity variation to break up uniform full-screen shell steps. " +
+                        "0 disables dithering."),
+                    _ditherStrength,
                     0f,
                     1f);
 
@@ -426,15 +462,24 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 EditorGUILayout.Slider(
                     new GUIContent(
                         "Core Black Strength",
-                        "Black opacity while the camera is inside the closed proxy volume."),
+                        "Final opacity after the camera enters the inward-shrunk core volume."),
                     _coreStrength,
                     0f,
                     1f);
 
             EditorGUILayout.HelpBox(
-                "0.0.10 removes nested fade shells. Outside the proxy, a single surface pass computes camera-to-fragment distance and applies a continuous smoothstep fade. " +
-                "Inside the proxy, stencil parity switches directly to Core Black Strength. Fade To Core = 100% is the seamless setting.",
+                "0.0.11 is a validation shader: eight nested closed-volume shells span from +Fade Distance to -Core Inset. " +
+                "Shell positions are denser near the outer edge and core boundary, each shell adds only 1/8 of the requested fade opacity, and optional dithering breaks up uniform steps. " +
+                "This costs 18 passes and is intended for quality/performance comparison.",
                 MessageType.None);
+
+            if (_coreInset > 0.025f)
+            {
+                EditorGUILayout.HelpBox(
+                    "Large Core Inset values can make thin or concave body regions self-intersect or collapse. " +
+                    "Start around 0.005-0.015 m and increase only if the inset volume remains valid.",
+                    MessageType.Warning);
+            }
         }
 
         private void DrawOutputSection()
@@ -478,7 +523,10 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 selectedCount > 0 &&
                 _meshQuality >= 0.1f &&
                 _meshQuality <= 1f &&
-                _fadeDistance >= 0f;
+                _fadeDistance >= 0f &&
+                _coreInset >= 0f &&
+                _ditherStrength >= 0f &&
+                _ditherStrength <= 1f;
 
             using (new EditorGUI.DisabledScope(!canGenerate))
             {
@@ -704,7 +752,9 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         _sealOpenBoundaries,
                         _planarBoneCaps,
                         _fadeDistance,
+                        _coreInset,
                         _fadeStrength,
+                        _ditherStrength,
                         _coreStrength,
                         _outputFolder,
                         _replaceExisting);

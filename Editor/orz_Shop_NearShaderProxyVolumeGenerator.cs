@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.3
+// Prototype version: 0.0.4
 
 using System;
 using System.Collections.Generic;
@@ -17,6 +17,15 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         internal const string ProxySuffix = "_NearShaderProxyVolume";
         internal const string ShaderName = "orz_Shop/NearShaderProxyVolume";
 
+        internal sealed class BoundaryDiagnostic
+        {
+            public string BoneName;
+            public int BoneIndex;
+            public int DescendantBoneCount;
+            public int DistalVertexCount;
+            public int SourceVertexCount;
+        }
+
         internal sealed class GenerationResult
         {
             public GameObject ProxyObject;
@@ -31,6 +40,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             public int BoundaryEdgesBeforeSeal;
             public int BoundaryEdgesAfterSeal;
             public int NonManifoldEdgesAfterSeal;
+            public List<BoundaryDiagnostic> BoundaryDiagnostics;
         }
 
         private struct VertexData
@@ -44,6 +54,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         private sealed class BoneBoundary
         {
             public Transform Bone;
+            public int BoneIndex;
+            public int DescendantBoneCount;
             public bool[] DistalBoneMask;
 
             public float DistalWeight(BoneWeight weight)
@@ -207,6 +219,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             List<BoneBoundary> boundaries = BuildBoneBoundaries(source, cutoffBones, out int skippedBoundaryCount);
             float distalThreshold = Mathf.Clamp(0.5f + boneCutBias, 0.01f, 0.99f);
+            List<BoundaryDiagnostic> boundaryDiagnostics =
+                BuildBoundaryDiagnostics(boundaries, sourceBoneWeights, distalThreshold);
 
             ClipGeometryByBoneBoundaries(
                 sourceVertices,
@@ -305,7 +319,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 SkippedBoundaryCount = skippedBoundaryCount,
                 BoundaryEdgesBeforeSeal = boundaryBeforeSeal,
                 BoundaryEdgesAfterSeal = boundaryAfterSeal,
-                NonManifoldEdgesAfterSeal = nonManifoldAfterSeal
+                NonManifoldEdgesAfterSeal = nonManifoldAfterSeal,
+                BoundaryDiagnostics = boundaryDiagnostics
             };
         }
 
@@ -359,7 +374,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 if (boundaryBone == null || !seen.Add(boundaryBone))
                     continue;
 
-                if (Array.IndexOf(bones, boundaryBone) < 0)
+                int boundaryBoneIndex = Array.IndexOf(bones, boundaryBone);
+                if (boundaryBoneIndex < 0)
                     throw new InvalidOperationException(
                         $"Boundary bone '{boundaryBone.name}' is not used by the source SkinnedMeshRenderer.");
 
@@ -388,7 +404,39 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                 result.Add(new BoneBoundary
                 {
                     Bone = boundaryBone,
+                    BoneIndex = boundaryBoneIndex,
+                    DescendantBoneCount = descendantCount,
                     DistalBoneMask = mask
+                });
+            }
+
+            return result;
+        }
+
+        private static List<BoundaryDiagnostic> BuildBoundaryDiagnostics(
+            IReadOnlyList<BoneBoundary> boundaries,
+            IReadOnlyList<BoneWeight> sourceBoneWeights,
+            float distalThreshold)
+        {
+            var result = new List<BoundaryDiagnostic>(boundaries.Count);
+
+            foreach (BoneBoundary boundary in boundaries)
+            {
+                int distalVertexCount = 0;
+
+                for (int i = 0; i < sourceBoneWeights.Count; i++)
+                {
+                    if (boundary.DistalWeight(sourceBoneWeights[i]) > distalThreshold)
+                        distalVertexCount++;
+                }
+
+                result.Add(new BoundaryDiagnostic
+                {
+                    BoneName = boundary.Bone != null ? boundary.Bone.name : "<null>",
+                    BoneIndex = boundary.BoneIndex,
+                    DescendantBoneCount = boundary.DescendantBoneCount,
+                    DistalVertexCount = distalVertexCount,
+                    SourceVertexCount = sourceBoneWeights.Count
                 });
             }
 

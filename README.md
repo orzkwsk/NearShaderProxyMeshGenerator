@@ -12,7 +12,7 @@ The proxy is backing geometry for a camera near/proximity shader. It is not a vi
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## 0.0.6 selection + topology-safe simplification
+## 0.0.7 body-following surface + planar bone caps
 
 Open:
 
@@ -77,6 +77,36 @@ Generated vertices keep interpolated skinning. Output skinning is normalized to 
 - Core Black Strength: `1.0`
 
 `Mesh Quality = 100%` disables intentional polygon reduction. A very small positional weld is still used to reconnect duplicated triangle vertices / source seams.
+
+### Planar Bone Caps
+
+0.0.7 adds flat cut sections for partial bone-region proxies.
+
+For every nearest renderer-bone parent/child pair where selection changes from checked to unchecked (or vice versa), the generator creates a bind-pose cut plane:
+
+- plane point: child-joint bind-pose position;
+- plane normal: parent -> child bone axis;
+- selected-side bone: the checked bone on that transition.
+
+After the bone-weight region has been extracted and epsilon-welded, each open boundary loop is matched to the nearest plausible bone cut plane.
+
+Matched loops are:
+
+1. projected onto the plane;
+2. rigidly reweighted to the selected-side bone;
+3. closed by a flat fan cap;
+4. tagged so later edge collapses cannot cross from the planar cap into the body surface.
+
+Edge collapses inside one planar cap are allowed, but their new vertex positions are reprojected onto the same cut plane. This preserves a flat, low-cost end section while the visible/functional outer side of the proxy remains body-following.
+
+Loops that cannot be matched safely to a bone transition use the existing fallback cap instead.
+
+The result panel reports:
+
+- detected bone cut planes;
+- planar caps;
+- fallback caps;
+- number of boundary vertices snapped to cut planes.
 
 ### Mesh Quality
 
@@ -171,6 +201,7 @@ The simple cap generator is intentionally not suitable for visible rendering; it
 - Tangents are not generated.
 - UV fidelity is not a goal.
 - Output skinning is reduced to four influences even when source selection analysis used more than four.
+- Planar cap matching is based on bind-pose bone transitions and spatial proximity; unusual rigs may fall back to the generic cap.
 - The topology-safe reducer is intentionally conservative and may stop well above very aggressive target ratios.
 - It uses shortest-edge style collapse cost with normal and skin-weight penalties rather than a full production QEM implementation.
 - Complex branching/non-manifold boundary loops may not be sealable by the simple fan-cap implementation.

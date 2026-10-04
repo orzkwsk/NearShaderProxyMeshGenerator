@@ -1,137 +1,163 @@
 # NearShaderProxyMeshGenerator
 
-Unity Editor prototype for generating a **closed skinned proxy volume** from an avatar/body `SkinnedMeshRenderer` for camera near/proximity blackout effects.
+Unity Editor prototype for generating a closed, skinned proxy volume from an avatar/body `SkinnedMeshRenderer`.
 
-The proxy is not intended as visible avatar geometry or a general-purpose LOD.
+The proxy is backing geometry for a camera near/proximity shader. It is not a visual LOD mesh.
 
 ## Branch policy
 
 - `main`: release / stable
 - `dev`: integration
-- `feature/*`: implementation and experiments
+- `feature/*`: implementation / experiment
 
 Current prototype: `feature/proxy-mesh-prototype`
 
-## Prototype 0.0.3
+## 0.0.5 selection model
 
-Menu:
+Open:
 
 `orz_Shop > Near Shader Proxy Volume Generator`
 
-### Bone boundary semantics
+0.0.5 replaces the previous terminal-boundary interpretation.
 
-0.0.2 used an infinite spatial cut plane through the selected bone. This could retain the wrong body half-space depending on bone axis/avatar layout.
+### Bone selection semantics
 
-0.0.3 changes the cutoff to **BoneWeight-based terminal boundaries**:
+Checked bones are the **included proxy region**.
 
-- selected bone itself is kept;
-- source bones that are descendants of the selected bone are treated as the distal side;
-- each vertex gets a distal-weight value from those descendant bone influences;
-- the default boundary is 50% distal weight;
-- triangles crossing that weight boundary are clipped and new vertex Normal/UV/BoneWeight values are interpolated;
-- multiple selected bones are applied as multiple terminal boundaries.
+For every source vertex:
 
-Examples:
+1. read all non-zero skin influences using `Mesh.GetBonesPerVertex()` and `Mesh.GetAllBoneWeights()`;
+2. sum the weights whose bone index is checked;
+3. keep/clip geometry at `Bone Weight Threshold`.
 
-- `Neck`: keep through Neck, remove Head-side weighting;
-- `Wrist`: keep through Wrist, remove finger-side weighting;
-- `UpperArm`: keep through UpperArm, remove LowerArm/Hand-side weighting.
+If every renderer bone is checked, the bone-region filter is bypassed completely and the full source mesh is used.
 
-`Bone Cut Bias` is centered at `0`:
+This gives a deterministic validation case:
 
-- `0`: 50% descendant weight boundary;
-- positive: keep more distal geometry;
-- negative: cut earlier.
+- **Select All** must start from the entire source body;
+- selecting one bone should produce the region weighted to that bone;
+- selecting a chain/group produces the combined weighted region.
 
-A selected terminal bone with no renderer-used descendants cannot define a BoneWeight boundary and is reported as skipped.
+The previous 0.0.2-0.0.4 behavior ("selected bone is a terminal cutoff and descendants are removed") is no longer used.
 
-### Geometry controls
+## Geometry pipeline
 
-Defaults are intentionally neutral:
+```text
+Source SkinnedMeshRenderer
+        |
+        +-- geometry/index read
+        |
+        +-- all BoneWeight1 influences
+        |
+        +-- checked-bone weight field
+        |
+        +-- triangle clipping at threshold
+        |
+        +-- epsilon weld
+        |
+        +-- optional Merge Size simplification
+        |
+        +-- optional Surface Offset
+        |
+        +-- boundary-loop sealing
+        |
+        +-- closed SkinnedMesh proxy
+```
 
-- `Merge Size = 0`
-- `Core Surface Offset = 0`
-- `Bone Cut Bias = 0`
+Generated vertices keep interpolated skinning. Output skinning is normalized to the strongest four influences per generated vertex.
 
-The EditorWindow migrates old serialized prototype values to these neutral defaults on first load of 0.0.3.
+## Conservative defaults
 
-`Merge Size = 0` means no intentional low-poly reduction. A very small epsilon weld is still performed because triangle clipping creates duplicate per-triangle vertices and the volume requires shared edges.
+- Bone Weight Threshold: `0.25`
+- Merge Size: `0`
+- Core Surface Offset: `0`
+- Seal Open Boundaries: On
+- Fade Distance: `0.05`
+- Fade Strength: `0.2`
+- Core Black Strength: `1.0`
 
-Increase `Merge Size` gradually only after verifying the generated coverage. Large values can collapse thin limbs or cut boundaries.
+`Merge Size = 0` performs no intentional low-poly reduction. Only a very small positional weld is used to reconnect duplicated triangle vertices / source seams.
 
-`Core Surface Offset` is a signed normal-direction adjustment:
+First confirm region extraction with Merge Size and Surface Offset at zero. Simplification comes afterwards.
 
-- `0`: preserve source surface;
-- negative: shrink;
-- positive: expand.
+## Bone UI
 
-### Closed-volume diagnostics
+The Volume Generator no longer uses `Selection.activeTransform` as the primary bone picker.
 
-After mesh generation the tool reports:
+The Source renderer's own `bones[]` array is displayed directly as a checklist, including bone indices.
 
-- `Boundary Edges Before Seal`
-- `Boundary Edges After Seal`
-- `Non-Manifold Edges After Seal`
+Controls:
 
-For the stencil-parity shader, the desired state is:
+- **Select All**
+- **Clear**
+- **Invert**
+- name filter
+- per-bone checkbox
 
-- `Boundary Edges After Seal = 0`
-- `Non-Manifold Edges After Seal = 0`
+This removes ambiguity about which renderer bone is actually selected.
 
-`Seal Open Boundaries` fills traced boundary loops using simple cap fans. Caps are backing geometry and are not intended for visible rendering.
+## Diagnostics
 
-## Shader concept
+The result panel reports:
 
-`Shaders/orz_Shop_NearShaderProxyVolume.shader` uses the generated mesh itself as the proximity volume. It does not use object-origin distance and does not use the original shader's fixed `vertex *= 3` expansion.
+- source vertex/triangle count;
+- selected bone count;
+- source vertices passing the weight threshold;
+- triangles after region clipping;
+- final proxy vertex/triangle count;
+- whether selection filtering was bypassed;
+- per-selected-bone influenced vertex count (up to 16 selected bones);
+- boundary edges before/after sealing;
+- non-manifold edges after sealing.
 
-Three nested shells are evaluated:
+When **Select All** is active, the result must say that bone selection was bypassed. If the upper body is still missing in that state, the defect is outside bone selection and should be investigated in geometry/index/weld/seal/rendering.
 
-1. outer shell = core expanded by `Fade Distance`;
-2. mid shell = core expanded by half `Fade Distance`;
-3. core = generated proxy surface.
+## Shader
 
-Each shell uses stencil parity to distinguish camera-inside from camera-outside state.
+`Shaders/orz_Shop_NearShaderProxyVolume.shader` uses the generated closed mesh as the proximity volume.
 
-The color passes use `Cull Off` in 0.0.3 so generated cap winding does not suppress the inside effect.
+It does not use the original shader's object-origin distance or fixed `vertex *= 3` expansion.
 
-Intended result:
+It currently renders three shells:
 
-- outside outer shell: no effect;
-- inside outer shell: light black fade;
-- inside mid shell: stronger fade;
-- inside core: black according to `Core Black Strength`.
+- core: source/proxy surface;
+- mid: half Fade Distance;
+- outer: full Fade Distance.
 
-The shader currently uses stencil bit `128` and six passes total.
+Each shell uses stencil parity to determine whether the camera ray starts inside the closed volume.
 
-## Recommended validation order
+The shader currently uses stencil bit `128`.
 
-1. Keep `Merge Size = 0` and `Core Surface Offset = 0`.
-2. Select one boundary bone and verify that the intended distal weighted region disappears.
-3. Verify `Boundary Edges After Seal = 0` and `Non-Manifold Edges After Seal = 0`.
-4. Add the remaining boundary bones.
-5. Test proximity fade/blackout.
-6. Only then increase `Merge Size` to reduce polygon count.
+## Closed-volume requirement
+
+Stencil parity assumes closed geometry.
+
+Desired diagnostics:
+
+```text
+Boundary Edges After Seal = 0
+Non-Manifold Edges After Seal = 0
+```
+
+The simple cap generator is intentionally not suitable for visible rendering; its purpose is only to close the proxy volume.
 
 ## Known limitations
 
-- BoneWeight boundary behavior depends on the avatar's actual skinning quality.
-- Legacy `BoneWeight` handling is reduced to the strongest four influences per generated vertex.
+- This is still a prototype and has not been validated against every avatar topology.
 - BlendShapes are not transferred.
 - Tangents are not generated.
 - UV fidelity is not a goal.
-- Boundary sealing uses simple fan caps.
-- Complex/non-manifold source topology can still defeat sealing/parity.
-- Self-intersections are not resolved.
-- The volume shader reserves stencil bit 128 while evaluating each shell.
+- Output skinning is reduced to four influences even when source selection analysis used more than four.
+- Position-based merging can join nearby surfaces if Merge Size is increased too far.
+- Complex branching/non-manifold boundary loops may not be sealed by the simple fan-cap implementation.
+- Self-intersection is not resolved.
+- The volume shader uses six passes and stencil bit 128.
+- Runtime/VR validation is still required before merging to `dev`.
 
-Generated assets default to:
+## Legacy baseline
 
-`Assets/Generated/NearShaderProxyMesh/`
+The original menu remains temporarily for comparison:
 
-## Current files
+`orz_Shop > Near Shader Proxy Mesh Generator`
 
-- `Editor/orz_Shop_NearShaderProxyMeshGenerator.cs` - 0.0.1 baseline generator.
-- `Editor/orz_Shop_NearShaderProxyMeshGeneratorWindow.cs` - 0.0.1 baseline window.
-- `Editor/orz_Shop_NearShaderProxyVolumeGenerator.cs` - 0.0.3 BoneWeight boundary / weld / sealing / skinning / asset generation.
-- `Editor/orz_Shop_NearShaderProxyVolumeGeneratorWindow.cs` - 0.0.3 controls and diagnostics.
-- `Shaders/orz_Shop_NearShaderProxyVolume.shader` - closed-volume stencil-parity blackout/fade shader.
+It is the 0.0.1 full-body baseline and does not implement bone-region extraction.

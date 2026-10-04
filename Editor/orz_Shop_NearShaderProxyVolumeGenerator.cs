@@ -1,5 +1,5 @@
 // NearShaderProxyMeshGenerator
-// Prototype version: 0.0.5
+// Prototype version: 0.0.6
 //
 // Selection model rewrite:
 // - Checked bones are the INCLUDED proxy region.
@@ -45,6 +45,13 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             public int ProxyVertexCount;
             public int ProxyTriangleCount;
+
+            public int PreSimplifyTriangleCount;
+            public int TargetTriangleCount;
+            public int SimplificationCollapseCount;
+            public bool SimplificationAttempted;
+            public bool SimplificationReachedTarget;
+            public string SimplificationStopReason;
 
             public int BoundaryEdgesBeforeSeal;
             public int BoundaryEdgesAfterSeal;
@@ -205,7 +212,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             Material requestedMaterial,
             IReadOnlyList<Transform> selectedBones,
             float selectionThreshold,
-            float mergeSize,
+            float meshQuality,
             float surfaceOffset,
             bool sealOpenBoundaries,
             float fadeDistance,
@@ -220,8 +227,8 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             if (source.sharedMesh == null)
                 throw new InvalidOperationException("Source SkinnedMeshRenderer has no sharedMesh.");
 
-            if (mergeSize < 0f)
-                throw new ArgumentOutOfRangeException(nameof(mergeSize), "Merge Size must not be negative.");
+            if (meshQuality < 0.1f || meshQuality > 1f)
+                throw new ArgumentOutOfRangeException(nameof(meshQuality), "Mesh Quality must be between 0.1 and 1.0.");
 
             if (selectionThreshold < 0f || selectionThreshold > 1f)
                 throw new ArgumentOutOfRangeException(nameof(selectionThreshold), "Selection Threshold must be between 0 and 1.");
@@ -290,18 +297,29 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
             int selectionTriangleCount = selectedTriangles.Count / 3;
 
+            // Build topology first with only an epsilon weld. Simplification is deliberately
+            // performed after sealing so the reducer starts from a closed 2-manifold whenever possible.
             Mesh proxyMesh = BuildProxy(
                 sourceMesh,
                 selectedVertices,
-                selectedTriangles,
-                mergeSize,
-                surfaceOffset);
+                selectedTriangles);
 
             Dictionary<EdgeKey, EdgeInfo> beforeEdges = BuildEdgeTable(proxyMesh.triangles);
             int boundaryBeforeSeal = beforeEdges.Count(pair => pair.Value.Count == 1);
 
             if (sealOpenBoundaries && boundaryBeforeSeal > 0)
                 SealOpenBoundaries(proxyMesh);
+
+            int preSimplifyTriangleCount = proxyMesh.triangles.Length / 3;
+
+            SimplificationStats simplification = SimplifyClosedMesh(
+                proxyMesh,
+                meshQuality);
+
+            // Surface offset does not change topology, so apply it only after topology-safe
+            // simplification has finished.
+            if (Mathf.Abs(surfaceOffset) > 1e-8f)
+                ApplySurfaceOffset(proxyMesh, surfaceOffset);
 
             Dictionary<EdgeKey, EdgeInfo> afterEdges = BuildEdgeTable(proxyMesh.triangles);
             int boundaryAfterSeal = afterEdges.Count(pair => pair.Value.Count == 1);
@@ -357,7 +375,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             proxyRenderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
             proxyRenderer.localBounds = ExpandBounds(
                 source.localBounds,
-                Mathf.Abs(surfaceOffset) + Mathf.Max(fadeDistance, mergeSize));
+                Mathf.Abs(surfaceOffset) + fadeDistance);
 
             EditorUtility.SetDirty(proxyObject);
             AssetDatabase.SaveAssets();
@@ -376,6 +394,13 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
 
                 ProxyVertexCount = proxyMesh.vertexCount,
                 ProxyTriangleCount = proxyMesh.triangles.Length / 3,
+
+                PreSimplifyTriangleCount = preSimplifyTriangleCount,
+                TargetTriangleCount = simplification.TargetTriangleCount,
+                SimplificationCollapseCount = simplification.CollapseCount,
+                SimplificationAttempted = simplification.Attempted,
+                SimplificationReachedTarget = simplification.ReachedTarget,
+                SimplificationStopReason = simplification.StopReason,
 
                 BoundaryEdgesBeforeSeal = boundaryBeforeSeal,
                 BoundaryEdgesAfterSeal = boundaryAfterSeal,
@@ -897,19 +922,14 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
         private static Mesh BuildProxy(
             Mesh sourceMesh,
             IReadOnlyList<VertexData> sourceVertices,
-            IReadOnlyList<int> sourceTriangles,
-            float mergeSize,
-            float surfaceOffset)
+            IReadOnlyList<int> sourceTriangles)
         {
-            float epsilonWeld =
+            // Only weld practically coincident vertices here. Coarser positional clustering
+            // used in 0.0.5 could create holes/non-manifold edges and break stencil parity.
+            float cellSize =
                 Mathf.Max(
                     1e-7f,
                     sourceMesh.bounds.size.magnitude * 1e-7f);
-
-            float cellSize =
-                mergeSize > 1e-7f
-                    ? mergeSize
-                    : epsilonWeld;
 
             var lookup = new Dictionary<GridKey, int>();
             var clusters = new List<Cluster>();
@@ -947,8 +967,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
                         : Vector3.up;
 
                 vertices.Add(
-                    cluster.PositionSum * invCount +
-                    normal * surfaceOffset);
+                    cluster.PositionSum * invCount);
 
                 normals.Add(normal);
                 uvs.Add(cluster.UvSum * invCount);
@@ -986,8 +1005,7 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             if (triangles.Count == 0)
             {
                 throw new InvalidOperationException(
-                    "Proxy generation produced no triangles. " +
-                    "Set Merge Size to 0 or broaden the bone selection.");
+                    "Proxy generation produced no triangles. Broaden the bone selection.");
             }
 
             var mesh = new Mesh
@@ -1008,6 +1026,702 @@ namespace orz_Shop.NearShaderProxyMeshGenerator
             mesh.RecalculateBounds();
 
             return mesh;
+        }
+
+
+        private sealed class SimplificationStats
+        {
+            public bool Attempted;
+            public bool ReachedTarget;
+            public int TargetTriangleCount;
+            public int CollapseCount;
+            public string StopReason;
+        }
+
+        private sealed class CollapseEdge
+        {
+            public int A;
+            public int B;
+            public int Count;
+            public int Opposite0 = -1;
+            public int Opposite1 = -1;
+        }
+
+        private sealed class CollapseProposal
+        {
+            public int Keep;
+            public int Remove;
+            public Vector3 Position;
+            public Vector3 Normal;
+            public Vector2 Uv;
+            public BoneWeight BoneWeight;
+        }
+
+        private readonly struct CollapseCandidate
+        {
+            public readonly int A;
+            public readonly int B;
+            public readonly float Cost;
+
+            public CollapseCandidate(int a, int b, float cost)
+            {
+                A = a;
+                B = b;
+                Cost = cost;
+            }
+        }
+
+        private static SimplificationStats SimplifyClosedMesh(
+            Mesh mesh,
+            float meshQuality)
+        {
+            int startTriangleCount = mesh.triangles.Length / 3;
+            int targetTriangleCount = Mathf.Max(
+                4,
+                Mathf.RoundToInt(startTriangleCount * Mathf.Clamp(meshQuality, 0.1f, 1f)));
+
+            var stats = new SimplificationStats
+            {
+                Attempted = meshQuality < 0.9999f,
+                ReachedTarget = startTriangleCount <= targetTriangleCount,
+                TargetTriangleCount = targetTriangleCount,
+                CollapseCount = 0,
+                StopReason = string.Empty
+            };
+
+            if (!stats.Attempted || stats.ReachedTarget)
+            {
+                stats.ReachedTarget = true;
+                return stats;
+            }
+
+            int[] initialTriangles = mesh.triangles;
+            if (!IsClosedTwoManifold(initialTriangles, out string initialReason))
+            {
+                stats.StopReason =
+                    "Topology-safe simplification skipped: " + initialReason;
+                return stats;
+            }
+
+            var vertices = mesh.vertices.ToList();
+            var normals =
+                mesh.normals != null && mesh.normals.Length == mesh.vertexCount
+                    ? mesh.normals.ToList()
+                    : Enumerable.Repeat(Vector3.up, mesh.vertexCount).ToList();
+
+            var uvs =
+                mesh.uv != null && mesh.uv.Length == mesh.vertexCount
+                    ? mesh.uv.ToList()
+                    : Enumerable.Repeat(Vector2.zero, mesh.vertexCount).ToList();
+
+            var weights =
+                mesh.boneWeights != null && mesh.boneWeights.Length == mesh.vertexCount
+                    ? mesh.boneWeights.ToList()
+                    : Enumerable.Repeat(
+                        new BoneWeight { boneIndex0 = 0, weight0 = 1f },
+                        mesh.vertexCount).ToList();
+
+            var triangles = initialTriangles.ToList();
+            var active = Enumerable.Repeat(true, vertices.Count).ToArray();
+
+            int passGuard = 0;
+
+            while (triangles.Count / 3 > targetTriangleCount && passGuard++ < 512)
+            {
+                BuildCollapseTopology(
+                    triangles,
+                    vertices.Count,
+                    out Dictionary<EdgeKey, CollapseEdge> edges,
+                    out HashSet<int>[] neighbors,
+                    out List<int>[] incidentTriangles);
+
+                if (edges.Values.Any(edge => edge.Count != 2))
+                {
+                    stats.StopReason =
+                        "Simplification stopped because the mesh ceased to be a closed 2-manifold.";
+                    break;
+                }
+
+                var candidates = new List<CollapseCandidate>(edges.Count);
+
+                foreach (CollapseEdge edge in edges.Values)
+                {
+                    if (!active[edge.A] || !active[edge.B] || edge.Count != 2)
+                        continue;
+
+                    float lengthCost =
+                        (vertices[edge.A] - vertices[edge.B]).sqrMagnitude;
+
+                    float normalDot =
+                        Mathf.Clamp(
+                            Vector3.Dot(
+                                normals[edge.A].normalized,
+                                normals[edge.B].normalized),
+                            -1f,
+                            1f);
+
+                    float normalPenalty =
+                        1f + (1f - normalDot) * 4f;
+
+                    float skinPenalty =
+                        1f + BoneWeightDistance(
+                            weights[edge.A],
+                            weights[edge.B]) * 3f;
+
+                    candidates.Add(
+                        new CollapseCandidate(
+                            edge.A,
+                            edge.B,
+                            lengthCost * normalPenalty * skinPenalty));
+                }
+
+                candidates.Sort(
+                    (left, right) => left.Cost.CompareTo(right.Cost));
+
+                var locked = new bool[vertices.Count];
+                var proposals = new List<CollapseProposal>();
+
+                int remainingToRemove =
+                    triangles.Count / 3 - targetTriangleCount;
+
+                foreach (CollapseCandidate candidate in candidates)
+                {
+                    if (remainingToRemove <= 0)
+                        break;
+
+                    int a = candidate.A;
+                    int b = candidate.B;
+
+                    if (!active[a] || !active[b] || locked[a] || locked[b])
+                        continue;
+
+                    EdgeKey key = new EdgeKey(a, b);
+
+                    if (!edges.TryGetValue(key, out CollapseEdge edge) ||
+                        edge.Count != 2)
+                    {
+                        continue;
+                    }
+
+                    if (!PassesLinkCondition(
+                        a,
+                        b,
+                        edge,
+                        neighbors))
+                    {
+                        continue;
+                    }
+
+                    Vector3 newPosition =
+                        (vertices[a] + vertices[b]) * 0.5f;
+
+                    if (!PassesCollapseGeometryCheck(
+                        a,
+                        b,
+                        newPosition,
+                        vertices,
+                        triangles,
+                        incidentTriangles))
+                    {
+                        continue;
+                    }
+
+                    int keep = Mathf.Min(a, b);
+                    int remove = Mathf.Max(a, b);
+
+                    Vector3 mergedNormal =
+                        normals[a] + normals[b];
+
+                    if (mergedNormal.sqrMagnitude > 1e-12f)
+                        mergedNormal.Normalize();
+                    else
+                        mergedNormal = normals[keep];
+
+                    proposals.Add(
+                        new CollapseProposal
+                        {
+                            Keep = keep,
+                            Remove = remove,
+                            Position = newPosition,
+                            Normal = mergedNormal,
+                            Uv = (uvs[a] + uvs[b]) * 0.5f,
+                            BoneWeight = LerpBoneWeight(
+                                weights[a],
+                                weights[b],
+                                0.5f)
+                        });
+
+                    LockOneRing(locked, a, neighbors);
+                    LockOneRing(locked, b, neighbors);
+
+                    // A valid interior edge collapse on a closed triangular 2-manifold
+                    // removes the two incident triangles.
+                    remainingToRemove -= 2;
+                }
+
+                if (proposals.Count == 0)
+                {
+                    stats.StopReason =
+                        "Topology/normal constraints prevent further safe edge collapses.";
+                    break;
+                }
+
+                List<int> candidateTriangles =
+                    ApplyCollapseProposalsToTriangles(
+                        triangles,
+                        proposals);
+
+                if (candidateTriangles.Count >= triangles.Count)
+                {
+                    stats.StopReason =
+                        "No further triangle reduction was produced by safe collapses.";
+                    break;
+                }
+
+                if (!IsClosedTwoManifold(
+                    candidateTriangles,
+                    out string validationReason))
+                {
+                    // Proposals are one-ring isolated, so failure here means this pass found
+                    // a pathological configuration. Roll the whole pass back rather than
+                    // accepting a leaky proxy.
+                    stats.StopReason =
+                        "A simplification pass was rolled back: " +
+                        validationReason;
+                    break;
+                }
+
+                foreach (CollapseProposal proposal in proposals)
+                {
+                    vertices[proposal.Keep] = proposal.Position;
+                    normals[proposal.Keep] = proposal.Normal;
+                    uvs[proposal.Keep] = proposal.Uv;
+                    weights[proposal.Keep] = proposal.BoneWeight;
+                    active[proposal.Remove] = false;
+                    stats.CollapseCount++;
+                }
+
+                triangles = candidateTriangles;
+            }
+
+            CompactSimplifiedMesh(
+                mesh,
+                vertices,
+                normals,
+                uvs,
+                weights,
+                active,
+                triangles);
+
+            int finalTriangleCount =
+                mesh.triangles.Length / 3;
+
+            stats.ReachedTarget =
+                finalTriangleCount <= targetTriangleCount;
+
+            if (!stats.ReachedTarget &&
+                string.IsNullOrEmpty(stats.StopReason))
+            {
+                stats.StopReason =
+                    "Topology-safe simplification reached its conservative limit.";
+            }
+
+            return stats;
+        }
+
+        private static void BuildCollapseTopology(
+            IReadOnlyList<int> triangles,
+            int vertexCount,
+            out Dictionary<EdgeKey, CollapseEdge> edges,
+            out HashSet<int>[] neighbors,
+            out List<int>[] incidentTriangles)
+        {
+            edges = new Dictionary<EdgeKey, CollapseEdge>();
+            neighbors = new HashSet<int>[vertexCount];
+            incidentTriangles = new List<int>[vertexCount];
+
+            for (int i = 0; i < vertexCount; i++)
+            {
+                neighbors[i] = new HashSet<int>();
+                incidentTriangles[i] = new List<int>();
+            }
+
+            for (int triangleStart = 0;
+                 triangleStart + 2 < triangles.Count;
+                 triangleStart += 3)
+            {
+                int a = triangles[triangleStart];
+                int b = triangles[triangleStart + 1];
+                int c = triangles[triangleStart + 2];
+
+                incidentTriangles[a].Add(triangleStart);
+                incidentTriangles[b].Add(triangleStart);
+                incidentTriangles[c].Add(triangleStart);
+
+                neighbors[a].Add(b);
+                neighbors[a].Add(c);
+                neighbors[b].Add(a);
+                neighbors[b].Add(c);
+                neighbors[c].Add(a);
+                neighbors[c].Add(b);
+
+                AddCollapseEdge(edges, a, b, c);
+                AddCollapseEdge(edges, b, c, a);
+                AddCollapseEdge(edges, c, a, b);
+            }
+        }
+
+        private static void AddCollapseEdge(
+            Dictionary<EdgeKey, CollapseEdge> edges,
+            int a,
+            int b,
+            int opposite)
+        {
+            EdgeKey key = new EdgeKey(a, b);
+
+            if (!edges.TryGetValue(key, out CollapseEdge edge))
+            {
+                edge = new CollapseEdge
+                {
+                    A = key.A,
+                    B = key.B,
+                    Count = 0
+                };
+
+                edges.Add(key, edge);
+            }
+
+            if (edge.Count == 0)
+                edge.Opposite0 = opposite;
+            else if (edge.Count == 1)
+                edge.Opposite1 = opposite;
+
+            edge.Count++;
+        }
+
+        private static bool PassesLinkCondition(
+            int a,
+            int b,
+            CollapseEdge edge,
+            IReadOnlyList<HashSet<int>> neighbors)
+        {
+            int commonCount = 0;
+
+            foreach (int candidate in neighbors[a])
+            {
+                if (!neighbors[b].Contains(candidate))
+                    continue;
+
+                if (candidate != edge.Opposite0 &&
+                    candidate != edge.Opposite1)
+                {
+                    return false;
+                }
+
+                commonCount++;
+            }
+
+            return commonCount == 2 &&
+                   edge.Opposite0 >= 0 &&
+                   edge.Opposite1 >= 0 &&
+                   edge.Opposite0 != edge.Opposite1;
+        }
+
+        private static bool PassesCollapseGeometryCheck(
+            int a,
+            int b,
+            Vector3 newPosition,
+            IReadOnlyList<Vector3> vertices,
+            IReadOnlyList<int> triangles,
+            IReadOnlyList<List<int>> incidentTriangles)
+        {
+            var affected =
+                new HashSet<int>(
+                    incidentTriangles[a]);
+
+            foreach (int triangleStart in incidentTriangles[b])
+                affected.Add(triangleStart);
+
+            foreach (int triangleStart in affected)
+            {
+                int ia = triangles[triangleStart];
+                int ib = triangles[triangleStart + 1];
+                int ic = triangles[triangleStart + 2];
+
+                bool hasA =
+                    ia == a || ib == a || ic == a;
+
+                bool hasB =
+                    ia == b || ib == b || ic == b;
+
+                // The two triangles incident to the collapsing edge disappear.
+                if (hasA && hasB)
+                    continue;
+
+                Vector3 oldA = vertices[ia];
+                Vector3 oldB = vertices[ib];
+                Vector3 oldC = vertices[ic];
+
+                Vector3 nextA =
+                    (ia == a || ia == b) ? newPosition : oldA;
+                Vector3 nextB =
+                    (ib == a || ib == b) ? newPosition : oldB;
+                Vector3 nextC =
+                    (ic == a || ic == b) ? newPosition : oldC;
+
+                Vector3 oldCross =
+                    Vector3.Cross(
+                        oldB - oldA,
+                        oldC - oldA);
+
+                Vector3 newCross =
+                    Vector3.Cross(
+                        nextB - nextA,
+                        nextC - nextA);
+
+                if (oldCross.sqrMagnitude < 1e-16f ||
+                    newCross.sqrMagnitude < 1e-16f)
+                {
+                    return false;
+                }
+
+                float orientation =
+                    Vector3.Dot(
+                        oldCross.normalized,
+                        newCross.normalized);
+
+                // Reject flips and very severe local folding.
+                if (orientation < 0.15f)
+                    return false;
+            }
+
+            return true;
+        }
+
+        private static void LockOneRing(
+            bool[] locked,
+            int vertex,
+            IReadOnlyList<HashSet<int>> neighbors)
+        {
+            locked[vertex] = true;
+
+            foreach (int neighbor in neighbors[vertex])
+                locked[neighbor] = true;
+        }
+
+        private static List<int> ApplyCollapseProposalsToTriangles(
+            IReadOnlyList<int> triangles,
+            IReadOnlyList<CollapseProposal> proposals)
+        {
+            var remap =
+                new Dictionary<int, int>();
+
+            foreach (CollapseProposal proposal in proposals)
+                remap[proposal.Remove] = proposal.Keep;
+
+            var result =
+                new List<int>(triangles.Count);
+
+            var seen =
+                new HashSet<TriangleKey>();
+
+            for (int i = 0;
+                 i + 2 < triangles.Count;
+                 i += 3)
+            {
+                int a = ResolveCollapseIndex(triangles[i], remap);
+                int b = ResolveCollapseIndex(triangles[i + 1], remap);
+                int c = ResolveCollapseIndex(triangles[i + 2], remap);
+
+                if (a == b || b == c || c == a)
+                    continue;
+
+                TriangleKey key =
+                    new TriangleKey(a, b, c);
+
+                if (!seen.Add(key))
+                    continue;
+
+                result.Add(a);
+                result.Add(b);
+                result.Add(c);
+            }
+
+            return result;
+        }
+
+        private static int ResolveCollapseIndex(
+            int index,
+            IReadOnlyDictionary<int, int> remap)
+        {
+            int current = index;
+            int guard = 0;
+
+            while (remap.TryGetValue(current, out int next) &&
+                   next != current &&
+                   guard++ < 16)
+            {
+                current = next;
+            }
+
+            return current;
+        }
+
+        private static bool IsClosedTwoManifold(
+            IReadOnlyList<int> triangles,
+            out string reason)
+        {
+            Dictionary<EdgeKey, EdgeInfo> edges =
+                BuildEdgeTable(triangles);
+
+            int boundaryCount =
+                edges.Count(pair => pair.Value.Count == 1);
+
+            if (boundaryCount > 0)
+            {
+                reason =
+                    $"{boundaryCount} boundary edge(s) remain.";
+                return false;
+            }
+
+            int nonManifoldCount =
+                edges.Count(pair => pair.Value.Count > 2);
+
+            if (nonManifoldCount > 0)
+            {
+                reason =
+                    $"{nonManifoldCount} non-manifold edge(s) remain.";
+                return false;
+            }
+
+            if (edges.Count == 0)
+            {
+                reason =
+                    "The mesh contains no usable edges.";
+                return false;
+            }
+
+            reason = string.Empty;
+            return true;
+        }
+
+        private static float BoneWeightDistance(
+            BoneWeight a,
+            BoneWeight b)
+        {
+            var values =
+                new Dictionary<int, float>();
+
+            AddInfluence(values, a.boneIndex0, a.weight0);
+            AddInfluence(values, a.boneIndex1, a.weight1);
+            AddInfluence(values, a.boneIndex2, a.weight2);
+            AddInfluence(values, a.boneIndex3, a.weight3);
+
+            AddInfluence(values, b.boneIndex0, -b.weight0);
+            AddInfluence(values, b.boneIndex1, -b.weight1);
+            AddInfluence(values, b.boneIndex2, -b.weight2);
+            AddInfluence(values, b.boneIndex3, -b.weight3);
+
+            float distance = 0f;
+
+            foreach (float value in values.Values)
+                distance += Mathf.Abs(value);
+
+            return Mathf.Clamp01(distance * 0.5f);
+        }
+
+        private static void CompactSimplifiedMesh(
+            Mesh mesh,
+            IReadOnlyList<Vector3> vertices,
+            IReadOnlyList<Vector3> normals,
+            IReadOnlyList<Vector2> uvs,
+            IReadOnlyList<BoneWeight> weights,
+            IReadOnlyList<bool> active,
+            IReadOnlyList<int> triangles)
+        {
+            var used =
+                new bool[vertices.Count];
+
+            foreach (int index in triangles)
+                used[index] = true;
+
+            var remap =
+                Enumerable.Repeat(-1, vertices.Count).ToArray();
+
+            var compactVertices = new List<Vector3>();
+            var compactNormals = new List<Vector3>();
+            var compactUvs = new List<Vector2>();
+            var compactWeights = new List<BoneWeight>();
+
+            for (int i = 0; i < vertices.Count; i++)
+            {
+                if (!active[i] || !used[i])
+                    continue;
+
+                remap[i] = compactVertices.Count;
+                compactVertices.Add(vertices[i]);
+                compactNormals.Add(normals[i]);
+                compactUvs.Add(uvs[i]);
+                compactWeights.Add(weights[i]);
+            }
+
+            var compactTriangles =
+                new List<int>(triangles.Count);
+
+            foreach (int oldIndex in triangles)
+            {
+                int newIndex = remap[oldIndex];
+
+                if (newIndex < 0)
+                {
+                    throw new InvalidOperationException(
+                        "Simplifier produced an invalid vertex remap.");
+                }
+
+                compactTriangles.Add(newIndex);
+            }
+
+            mesh.Clear();
+            mesh.indexFormat =
+                compactVertices.Count > 65535
+                    ? IndexFormat.UInt32
+                    : IndexFormat.UInt16;
+
+            mesh.SetVertices(compactVertices);
+            mesh.SetNormals(compactNormals);
+            mesh.SetUVs(0, compactUvs);
+            mesh.boneWeights = compactWeights.ToArray();
+            mesh.SetTriangles(compactTriangles, 0, true);
+            mesh.RecalculateBounds();
+        }
+
+        private static void ApplySurfaceOffset(
+            Mesh mesh,
+            float surfaceOffset)
+        {
+            Vector3[] vertices = mesh.vertices;
+            Vector3[] normals = mesh.normals;
+
+            if (normals == null ||
+                normals.Length != vertices.Length)
+            {
+                mesh.RecalculateNormals();
+                normals = mesh.normals;
+            }
+
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                Vector3 normal =
+                    normals[i].sqrMagnitude > 1e-12f
+                        ? normals[i].normalized
+                        : Vector3.up;
+
+                vertices[i] +=
+                    normal * surfaceOffset;
+            }
+
+            mesh.vertices = vertices;
+            mesh.RecalculateBounds();
         }
 
         private static Dictionary<EdgeKey, EdgeInfo> BuildEdgeTable(
